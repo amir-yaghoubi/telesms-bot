@@ -2,12 +2,34 @@
 
 Target: a Linux host where a USB LTE modem is already owned by
 **host** ModemManager (bare metal, or a VM after
-[proxmox-usb-passthrough.md](proxmox-usb-passthrough.md) and
-[ubuntu-modem-setup.md](ubuntu-modem-setup.md)).
+[Proxmox USB passthrough](proxmox-usb-passthrough.md) and
+[Ubuntu modem setup](ubuntu-modem-setup.md)).
 
 The container only talks to the system D-Bus socket. Do not pass
 `/dev/cdc-wdm0` or `ttyUSB*` into it, and do not run ModemManager inside
 Docker.
+
+```mermaid
+flowchart TB
+    subgraph Host["Linux host"]
+        Stick[USB LTE modem]
+        MM[ModemManager]
+        DBus["/var/run/dbus"]
+        Stick --> MM
+        MM --> DBus
+
+        subgraph Ctr["telesms container"]
+            Bot[telesms-bot]
+            Data["./data"]
+            Secrets["./secrets"]
+        end
+
+        DBus -->|"unix socket mount"| Bot
+    end
+
+    Bot --> TG[Telegram]
+    Bot --> Google[Google Contacts]
+```
 
 `compose.yaml` mounts `/var/run/dbus`, sets
 `DBUS_SYSTEM_BUS_ADDRESS=unix:path=/var/run/dbus/system_bus_socket`,
@@ -28,9 +50,26 @@ root-in-container + `apparmor:unconfined`.
 
 ---
 
+## Deploy flow
+
+```mermaid
+flowchart TD
+    P[Stick registered on the host] --> C[Copy .env.example → .env]
+    C --> T[Copy google-token.json into secrets/]
+    T --> S[Stop any native instance of the same bot]
+    S --> U["docker compose up -d --build"]
+    U --> V[logs + check-modem]
+    V --> Q{Healthy?}
+    Q -->|yes| SMS[Send one SMS both ways]
+    Q -->|AccessDenied| AA[Confirm apparmor:unconfined]
+    Q -->|modem not found| MM[Fix MODEM_UID on the host]
+```
+
+---
+
 ## 1. Prerequisites (on the host)
 
-- Stick visible and **registered**: [ubuntu-modem-setup.md](ubuntu-modem-setup.md).
+- Stick visible and **registered**: [Ubuntu modem setup](ubuntu-modem-setup.md).
   `mmcli -m "$MODEM_UID"` must print `System.device` equal to `.env`
   `MODEM_UID` (for the DWM-222 preset: `dwm222`, not `/sys/devices/…`).
 - Docker Engine + Compose plugin.
@@ -87,7 +126,7 @@ docker compose run --rm telesms telesms-bot check-modem
 | `check-modem` prints `/org/freedesktop/ModemManager1/Modem/N` | D-Bus + `MODEM_UID` match |
 | `processing modem inbox n=…` | Inbox subscribe OK |
 | `AccessDenied` / D-Bus `Hello` panic | AppArmor — confirm `compose.yaml` has `apparmor:unconfined`, then `docker compose up -d` |
-| `modem not found: dwm222` | Host `System.device` is not `dwm222` yet — [ubuntu-modem-setup.md](ubuntu-modem-setup.md) |
+| `modem not found: dwm222` | Host `System.device` is not `dwm222` yet — [Ubuntu modem setup](ubuntu-modem-setup.md) |
 | `check-modem` OK but inbox still failing | Restart the bot after ModemManager was restarted: `docker compose restart telesms` |
 
 Then send one SMS to the stick → Telegram topic, and type in a contact
@@ -111,7 +150,7 @@ docker compose up -d --build
   fix with `docker builder prune` and rebuild.
 - Host reboot: systemd starts Docker after dbus; the container
   auto-starts. If `mmcli` shows `state: disabled`, enable the modem
-  ([ubuntu-modem-setup.md](ubuntu-modem-setup.md)) and
+  ([Ubuntu modem setup](ubuntu-modem-setup.md)) and
   `docker compose restart telesms`.
 - After you restart ModemManager on the host (UID fix, USB replug),
   restart the container so it does not sit on a stale D-Bus subscribe

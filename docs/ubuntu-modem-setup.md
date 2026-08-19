@@ -1,15 +1,43 @@
-# Ubuntu: make a USB LTE modem ready for telesms-bot
+# Ubuntu: prepare a USB LTE modem
 
 The bot talks to **host** ModemManager over D-Bus. It never opens
 `/dev/cdc-wdm0`. Set `MODEM_UID` to the modem’s **Device** field
 (`mmcli` `System.device`).
 
 If the host is a VM, attach the stick first:
-[proxmox-usb-passthrough.md](proxmox-usb-passthrough.md). Then run this
-file **inside the guest**.
+[Proxmox USB passthrough](proxmox-usb-passthrough.md). Then run this
+guide **inside the guest**.
 
-Tested with a D-Link DWM-222 (QMI). Other QMI/MBIM sticks that show up in
-`mmcli -L` work the same way.
+Tested with a D-Link DWM-222 (QMI). Other QMI/MBIM sticks that appear in
+`mmcli -L` follow the same steps.
+
+```mermaid
+flowchart LR
+    subgraph Guest["Ubuntu host or VM"]
+        Stick[USB LTE stick] --> Udev[udev UID rule]
+        Udev --> MM[ModemManager]
+        MM -->|"System.device = MODEM_UID"| Bot[telesms-bot]
+    end
+    Bot --> TG[Telegram]
+```
+
+---
+
+## Bring-up overview
+
+```mermaid
+flowchart TD
+    A[Install packages] --> B[Optional: pin a stable UID]
+    B --> C[Restart ModemManager]
+    C --> D["mmcli -L shows the modem"]
+    D --> E[Enable the modem]
+    E --> F{State?}
+    F -->|registered or connected| G[SMS sanity check]
+    F -->|disabled| E
+    F -->|sim-missing / failed| H[Reseat SIM]
+    G --> I["Set MODEM_UID in .env"]
+    I --> J[cargo run or Compose]
+```
 
 ---
 
@@ -21,8 +49,8 @@ From a checkout of this repo:
 sudo ./scripts/setup-ubuntu-modem.sh
 ```
 
-That installs `usb-modeswitch` + `modemmanager`, enables ModemManager, and
-adds your user to `dialout`.
+That installs `usb-modeswitch` and `modemmanager`, enables ModemManager,
+and adds your user to `dialout`.
 
 ### Stable name (recommended)
 
@@ -135,15 +163,54 @@ unless you use `qmi-proxy`. Direct open returns `endpoint hangup`.
 MODEM_UID=dwm222          # must equal mmcli System.device exactly
 ```
 
-Then `cargo run` or Compose ([deploy-docker.md](deploy-docker.md)).
+Then `cargo run` or Compose ([Docker Compose](deploy-docker.md)).
+
+---
+
+## Zero-CD (modeswitch)
+
+Many LTE sticks first appear as a virtual CD, then switch to modem mode.
+That switch must happen on the **same machine** that runs ModemManager.
+
+```mermaid
+sequenceDiagram
+    participant Stick as USB stick
+    participant Kernel as Linux kernel
+    participant MS as usb_modeswitch
+    participant MM as ModemManager
+
+    Stick->>Kernel: Enumerate as mass storage
+    Note over Stick: e.g. DWM-222 2001:ac01
+    Kernel->>MS: udev / eject
+    MS->>Stick: Leave storage mode
+    Stick->>Kernel: Re-enumerate as modem
+    Note over Stick: e.g. 2001:7e3d option + qmi_wwan
+    Kernel->>MM: Probe
+    MM->>MM: Copy ID_MM_PHYSDEV_UID into System.device
+```
 
 ---
 
 ## Troubleshooting
 
+```mermaid
+flowchart TD
+    Start[Stick not usable] --> Lsusb{Guest lsusb?}
+    Lsusb -->|Only root hubs| PVE[Passthrough missing — Proxmox guide]
+    Lsusb -->|Mass storage / CD| CD[Modeswitch on this host]
+    Lsusb -->|Modem VID:PID| MM{mmcli -L?}
+    MM -->|Empty| Wait[Restart MM, wait 10s]
+    MM -->|Shows modem| State{mmcli state?}
+    State -->|disabled| En[sudo mmcli --enable]
+    State -->|sim-missing / failed| SIM[Reseat SIM]
+    State -->|registered| UID{System.device equals MODEM_UID?}
+    UID -->|no| Pin[udev UID + restart MM]
+    UID -->|yes| OK[Ready for the bot]
+```
+
 | Symptom | What to do |
 |---|---|
-| `lsusb` only root hubs | Stick is not on this machine — [proxmox-usb-passthrough.md](proxmox-usb-passthrough.md) |
+| `lsusb` only root hubs | Stick is not on this machine — [Proxmox USB passthrough](proxmox-usb-passthrough.md) |
 | Stuck as USB CD / mass storage (`2001:ac01` on a DWM-222) | `--storage` + that VID:PID; `eject /dev/sr0`; check udev |
 | Modem-mode `2001:7e3d` still shows one `usb-storage` interface | Normal leftover SD/CD iface; ignore if `option` + `qmi_wwan` are bound |
 | `mmcli`: `sim-missing` | Reseat mini-SIM |
@@ -162,7 +229,7 @@ Then `cargo run` or Compose ([deploy-docker.md](deploy-docker.md)).
 This firmware stays in **QMI** on Linux. SMS goes through ModemManager, not
 the stick’s RNDIS web UI (`192.168.0.1`).
 
-| | |
+| Mode | USB id |
 |---|---|
 | Zero-CD (first plug) | `2001:ac01` |
 | Modem mode | `2001:7e3d` — `option` + `qmi_wwan` |

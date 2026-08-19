@@ -11,8 +11,43 @@ never sees the modem.
 Always pass through the **USB port**, not VID:PID.
 
 The guest can have a QEMU XHCI controller and still show **only USB root
-hubs**. That means this file is not done yet — nothing is attached to
+hubs**. That means this guide is not done yet — nothing is attached to
 that controller.
+
+```mermaid
+flowchart LR
+    Stick[USB LTE stick] --> Port[Physical USB port]
+    Port --> PVE[Proxmox host]
+    PVE -->|"usb0: host=bus-port"| VM[Ubuntu VM]
+    VM --> MM[Guest ModemManager]
+    MM --> Bot[telesms-bot]
+```
+
+After the guest sees the stick, continue with
+[Ubuntu modem setup](ubuntu-modem-setup.md) **inside the VM**.
+
+---
+
+## Why port mapping, not VID:PID
+
+```mermaid
+sequenceDiagram
+    participant Stick as USB stick
+    participant PVE as Proxmox host
+    participant VM as Ubuntu VM
+
+    Note over Stick: First enumeration: Zero-CD<br/>e.g. 2001:ac01
+    Stick->>PVE: Plug in
+    alt Bound by VID:PID of storage mode
+        PVE->>VM: Attach 2001:ac01
+        Stick->>PVE: Re-enumerate as modem 2001:7e3d
+        PVE--xVM: Mapping no longer matches — device dropped
+    else Bound by USB port
+        PVE->>VM: Attach whatever is on that port
+        Stick->>PVE: Re-enumerate as modem
+        PVE->>VM: Same port, new identity — stick stays
+    end
+```
 
 ---
 
@@ -31,6 +66,15 @@ port on the chassis you will not use for keyboards or disks.
 
 Unplug and replug once. Confirm the **port number stays the same** even
 if the product ID changes (zero-CD → modem).
+
+```mermaid
+flowchart LR
+    A["lsusb -t"] --> B["Note bus-port e.g. 1-4"]
+    B --> C[Unplug / replug]
+    C --> D{Port number unchanged?}
+    D -->|yes| E["Use usb0: host=1-4"]
+    D -->|no| F[Try a different physical socket]
+```
 
 ---
 
@@ -81,6 +125,15 @@ ModemManager), the VM may see nothing or a half-switched stick. On the
 host, blacklist or avoid binding `option` / `qmi_wwan` / modeswitch for
 this port if that becomes a problem.
 
+```mermaid
+flowchart TD
+    Stick[Stick on dedicated port] --> Who{Who should own it?}
+    Who -->|Proxmox host| Bad[Host modeswitch / MM claims it]
+    Bad --> Fail[Guest sees nothing or half-switched stick]
+    Who -->|Ubuntu VM| Good[Guest udev + ModemManager]
+    Good --> Next[Ubuntu modem setup]
+```
+
 ---
 
 ## 4. Check from the VM
@@ -93,12 +146,12 @@ lsusb -t
 | Guest `lsusb` | Meaning |
 |---|---|
 | Only `Linux Foundation` root hubs | Passthrough missing (VID:PID bind, wrong port, or stick unplugged) |
-| `2001:ac01` mass storage / CD | Zero-CD; modeswitch on the **guest** — [ubuntu-modem-setup.md](ubuntu-modem-setup.md) |
+| `2001:ac01` mass storage / CD | Zero-CD; modeswitch on the **guest** — [Ubuntu modem setup](ubuntu-modem-setup.md) |
 | `2001:7e3d D-Link Corp. Mobile Connect` with `option` + `qmi_wwan` | Stick is in the guest. One leftover `usb-storage` interface in this mode is normal. Continue with modem setup. |
 
 Then ModemManager + UID on the guest:
-[ubuntu-modem-setup.md](ubuntu-modem-setup.md). Then the bot:
-[deploy-docker.md](deploy-docker.md).
+[Ubuntu modem setup](ubuntu-modem-setup.md). Then the bot:
+[Docker Compose](deploy-docker.md).
 
 ---
 
