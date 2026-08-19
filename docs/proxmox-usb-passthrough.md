@@ -10,6 +10,10 @@ never sees the modem.
 
 Always pass through the **USB port**, not VID:PID.
 
+The guest can have a QEMU XHCI controller and still show **only USB root
+hubs**. That means this file is not done yet — nothing is attached to
+that controller.
+
 ---
 
 ## 1. Find the port on the Proxmox host
@@ -81,17 +85,20 @@ this port if that becomes a problem.
 
 ## 4. Check from the VM
 
-After the VM is up and the stick is in that port:
-
 ```bash
 lsusb
+lsusb -t
 ```
 
-If it stays in storage/CD mode forever, udev/modeswitch on the VM is
-missing — see [ubuntu-modem-setup.md](ubuntu-modem-setup.md).
+| Guest `lsusb` | Meaning |
+|---|---|
+| Only `Linux Foundation` root hubs | Passthrough missing (VID:PID bind, wrong port, or stick unplugged) |
+| `2001:ac01` mass storage / CD | Zero-CD; modeswitch on the **guest** — [ubuntu-modem-setup.md](ubuntu-modem-setup.md) |
+| `2001:7e3d D-Link Corp. Mobile Connect` with `option` + `qmi_wwan` | Stick is in the guest. One leftover `usb-storage` interface in this mode is normal. Continue with modem setup. |
 
-If `lsusb` never shows the stick, passthrough is wrong (VID:PID bind,
-wrong port, or host still owns it).
+Then ModemManager + UID on the guest:
+[ubuntu-modem-setup.md](ubuntu-modem-setup.md). Then the bot:
+[deploy-docker.md](deploy-docker.md).
 
 ---
 
@@ -101,6 +108,3 @@ wrong port, or host still owns it).
 - Reboot the VM with the stick inserted; it should reappear on the same
   port.
 - Moving the stick to another physical socket requires updating `host=…`.
-
-Guest ModemManager setup: [ubuntu-modem-setup.md](ubuntu-modem-setup.md).
-D-Bus + Compose on the VM: [ubuntu-vm-host-setup.md](ubuntu-vm-host-setup.md).

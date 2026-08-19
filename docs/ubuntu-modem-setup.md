@@ -1,14 +1,15 @@
 # Ubuntu: make a USB LTE modem ready for telesms-bot
 
-The bot talks to **host** ModemManager over D-Bus. It does not open
-`/dev/cdc-wdm0` itself. Any stick ModemManager can register is usable:
-set `MODEM_UID` to that modem’s Device field.
+The bot talks to **host** ModemManager over D-Bus. It never opens
+`/dev/cdc-wdm0`. Set `MODEM_UID` to the modem’s **Device** field
+(`mmcli` `System.device`).
 
-Do **not** run ModemManager inside Docker. The container only mounts the
-system D-Bus socket.
+If the host is a VM, attach the stick first:
+[proxmox-usb-passthrough.md](proxmox-usb-passthrough.md). Then run this
+file **inside the guest**.
 
 Tested with a D-Link DWM-222 (QMI). Other QMI/MBIM sticks that show up in
-`mmcli -L` should work the same way.
+`mmcli -L` work the same way.
 
 ---
 
@@ -57,16 +58,24 @@ The script writes:
 | `/usr/share/usb_modeswitch/…` | StandardEject when `--storage` is set |
 | `/usr/local/bin/telesms-modem` | `mmcli -m <uid>` wrapper |
 
-Unplug and replug after a UID rule. Then:
+Adding the udev rule is **not** enough by itself. ModemManager copies
+`ID_MM_PHYSDEV_UID` into `System.device` at **probe** time. If the stick
+was already enumerated, `udevadm info` can show `ID_MM_PHYSDEV_UID=dwm222`
+while `mmcli` still prints a sysfs path. Restart MM, then wait ~10 s:
 
 ```bash
+sudo systemctl restart ModemManager
+sleep 10
 lsusb
 mmcli -L
-mmcli -m stick          # or: telesms-modem
+mmcli -m dwm222          # or: telesms-modem
 ```
 
 `System.device` must equal the UID you passed. Put that value in `.env`
 as `MODEM_UID`.
+
+A VM cannot unplug the physical stick; the MM restart is the usual fix
+there.
 
 ---
 
@@ -82,22 +91,28 @@ change if you move the stick to another USB port. Prefer `--uid` + `--usb`.
 
 ---
 
-## 3. Check the stick
+## 3. Enable and register
 
-Wait ~20 s after plug for probe + network registration.
+Wait ~20 s after plug for probe. `mmcli` may show `state: disabled` even
+with a healthy SIM. Listing works as a normal user; **enable** needs
+root / polkit:
 
 ```bash
-mmcli -m "$MODEM_UID"     # or mmcli -m 0
+sudo mmcli -m "$MODEM_UID" --enable
+sleep 8
+mmcli -m "$MODEM_UID"
 # expect: state registered (or connected)
 ```
 
-If PIN locked:
+`lock: sim-pin2` / `enabled locks: fixed-dialing` is **not** PIN1. Do not
+treat that as a blocked SIM. If PIN1 really is locked:
 
 ```bash
-mmcli -i any --pin=1234
+sudo mmcli -i any --pin=1234
 ```
 
-List / read / send (sanity check before starting the bot):
+SMS works in `registered` without a data bearer. Sanity check before
+starting the bot:
 
 ```bash
 mmcli -m "$MODEM_UID" --messaging-list-sms
@@ -117,14 +132,10 @@ unless you use `qmi-proxy`. Direct open returns `endpoint hangup`.
 
 ```bash
 # .env
-MODEM_UID=stick          # Device field / ID_MM_PHYSDEV_UID
+MODEM_UID=dwm222          # must equal mmcli System.device exactly
 ```
 
-Then run natively (`cargo run`) or with Compose
-([deploy-docker.md](deploy-docker.md)).
-
-VM USB passthrough: [proxmox-usb-passthrough.md](proxmox-usb-passthrough.md).
-Docker + D-Bus on the VM: [ubuntu-vm-host-setup.md](ubuntu-vm-host-setup.md).
+Then `cargo run` or Compose ([deploy-docker.md](deploy-docker.md)).
 
 ---
 
@@ -132,14 +143,17 @@ Docker + D-Bus on the VM: [ubuntu-vm-host-setup.md](ubuntu-vm-host-setup.md).
 
 | Symptom | What to do |
 |---|---|
-| Stuck as a USB CD / mass storage | Pass `--storage` with that VID:PID; `eject /dev/sr0`; check udev |
+| `lsusb` only root hubs | Stick is not on this machine — [proxmox-usb-passthrough.md](proxmox-usb-passthrough.md) |
+| Stuck as USB CD / mass storage (`2001:ac01` on a DWM-222) | `--storage` + that VID:PID; `eject /dev/sr0`; check udev |
+| Modem-mode `2001:7e3d` still shows one `usb-storage` interface | Normal leftover SD/CD iface; ignore if `option` + `qmi_wwan` are bound |
 | `mmcli`: `sim-missing` | Reseat mini-SIM |
 | `Couldn't get SIM lock status after 7 retries` | Same as missing SIM, or probe raced — unplug, wait 5 s, replug |
-| `mmcli -m 0` gone after replug | Use a UID (`--uid` / `--usb`) |
-| `mmcli -m <uid>` not found | `udevadm info` on the USB device should show `ID_MM_PHYSDEV_UID`; restart ModemManager |
+| `mmcli -L` empty after `systemctl restart ModemManager` | Wait ~10 s for re-probe |
+| `mmcli -m 0` works, `mmcli -m dwm222` does not | udev UID not applied at probe — restart ModemManager (section 1) |
+| `mmcli -m <uid>` not found, udev has no `ID_MM_PHYSDEV_UID` | Re-run the setup script; `udevadm info` on the USB device |
+| `state: disabled` | `sudo mmcli -m "$MODEM_UID" --enable` |
 | `qmicli`: endpoint hangup | Stop ModemManager or use `--device-open-proxy` |
-| `telesms-bot`: modem not found | `MODEM_UID` must match `mmcli` Device exactly |
-| Docker: AppArmor `AccessDenied` on D-Bus `Hello` | Compose must set `apparmor:unconfined` ([deploy-docker.md](deploy-docker.md)) |
+| Bot: `modem not found: dwm222` | `MODEM_UID` ≠ `System.device` (still a sysfs path, or typo) |
 
 ---
 
