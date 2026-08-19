@@ -77,5 +77,8 @@ docker compose up -d --build
 - The container is root-in-container on purpose (ModemManager's D-Bus
   policy admits root). Do not host untrusted containers on the same
   machine without revisiting that decision.
+- Ubuntu AppArmor's `docker-default` profile blocks D-Bus `Hello` on the
+  host system bus (`AccessDenied` / `sender="(null)"`). Compose sets
+  `apparmor:unconfined` so the container can talk to host ModemManager.
 - Host reboot: systemd starts Docker after dbus; the container auto-starts
   and the daemon's retry loops re-attach to the modem.

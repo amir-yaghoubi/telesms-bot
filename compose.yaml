@@ -8,6 +8,9 @@ services:
     environment:
       TZ: Asia/Tehran
       DBUS_SYSTEM_BUS_ADDRESS: unix:path=/var/run/dbus/system_bus_socket
+    # docker-default AppArmor (Ubuntu) denies D-Bus Hello to the host system bus.
+    security_opt:
+      - apparmor:unconfined
     volumes:
       - /var/run/dbus:/var/run/dbus
       - ./data:/app/data

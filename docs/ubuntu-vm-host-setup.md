@@ -37,6 +37,10 @@ If the container is not root, add a `/etc/dbus-1/system.d/` policy so that
 uid can call `org.freedesktop.ModemManager1`. Root-in-container on the
 system bus is enough for a first deploy.
 
+On Ubuntu, also drop Docker's AppArmor profile for this service
+(`security_opt: apparmor:unconfined` in Compose). `docker-default`
+denies D-Bus `Hello` even when the socket is mounted.
+
 Do not pass `/dev/cdc-wdm0` or `ttyUSB*` into the container.
 
 ---

@@ -139,6 +139,7 @@ Docker + D-Bus on the VM: [ubuntu-vm-host-setup.md](ubuntu-vm-host-setup.md).
 | `mmcli -m <uid>` not found | `udevadm info` on the USB device should show `ID_MM_PHYSDEV_UID`; restart ModemManager |
 | `qmicli`: endpoint hangup | Stop ModemManager or use `--device-open-proxy` |
 | `telesms-bot`: modem not found | `MODEM_UID` must match `mmcli` Device exactly |
+| Docker: AppArmor `AccessDenied` on D-Bus `Hello` | Compose must set `apparmor:unconfined` ([deploy-docker.md](deploy-docker.md)) |
 
 ---
 
