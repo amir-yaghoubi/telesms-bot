@@ -1,0 +1,19 @@
+services:
+  telesms:
+    build: .
+    image: telesms-bot:latest
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    environment:
+      TZ: Asia/Tehran
+      DBUS_SYSTEM_BUS_ADDRESS: unix:path=/var/run/dbus/system_bus_socket
+    volumes:
+      - /var/run/dbus:/var/run/dbus
+      - ./data:/app/data
+      - ./secrets:/app/secrets
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

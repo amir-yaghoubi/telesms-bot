@@ -1,0 +1,12 @@
+.git
+.gitignore
+.env
+.agents
+.worktrees
+data
+secrets
+docs
+host
+target
+vendor
+skills-lock.json

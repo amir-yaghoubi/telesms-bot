@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+.env
+.env.*
+!.env.example
+/data
+*.sqlite
+*.sqlite-journal
+/secrets
+.DS_Store
+.worktrees/
+.agents/
+skills-lock.json
+docs/superpowers/
