@@ -12,14 +12,19 @@ use zbus::proxy;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::Connection;
 
+use crate::call_forward::{
+    parse_ussd_reply, ussd_disable, ussd_enable, ussd_query, CallForwardState,
+};
 use crate::modem::{
     radio_from_access_tech, sim_status, CallForward, IncomingSms, ModemError, ModemInfo, ModemLive,
     ModemState, Registration, SmsInbox, SmsModem,
 };
+use crate::normalize::normalize_e164;
 
 const MM_DEST: &str = "org.freedesktop.ModemManager1";
 const MM_PATH: &str = "/org/freedesktop/ModemManager1";
 const MM_MODEM_IFACE: &str = "org.freedesktop.ModemManager1.Modem";
+const USSD_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// PDU type 2 is submit (outbound). Deliver is 1.
 pub fn sms_is_inbound(pdu_type: u32) -> bool {
@@ -109,6 +114,15 @@ trait Modem3gpp {
     fn operator_name(&self) -> zbus::Result<String>;
     #[zbus(property)]
     fn registration_state(&self) -> zbus::Result<u32>;
+}
+
+#[proxy(
+    interface = "org.freedesktop.ModemManager1.Modem.Modem3gpp.Ussd",
+    default_service = "org.freedesktop.ModemManager1"
+)]
+trait Ussd {
+    fn initiate(&self, command: &str) -> zbus::Result<String>;
+    fn cancel(&self) -> zbus::Result<()>;
 }
 
 #[proxy(
@@ -350,6 +364,36 @@ impl MmModem {
             },
         ))
     }
+
+    async fn ussd_roundtrip(
+        &self,
+        command: &str,
+        default_region: &str,
+    ) -> Result<CallForwardState, ModemError> {
+        self.with_modem_path(|modem_path| {
+            let conn = self.conn.clone();
+            let command = command.to_string();
+            let default_region = default_region.to_string();
+            async move {
+                let ussd = UssdProxy::builder(&conn)
+                    .path(&modem_path)
+                    .map_err(mm_err)?
+                    .build()
+                    .await
+                    .map_err(mm_err)?;
+
+                let _ = ussd.cancel().await;
+                let result = tokio::time::timeout(USSD_TIMEOUT, ussd.initiate(&command)).await;
+                let _ = ussd.cancel().await;
+
+                let reply = result
+                    .map_err(|_| ModemError::Failed("ussd timeout".into()))?
+                    .map_err(mm_err)?;
+                parse_ussd_reply(&reply, &default_region).map_err(ModemError::Failed)
+            }
+        })
+        .await
+    }
 }
 
 async fn load_incoming_sms(
@@ -547,26 +591,39 @@ impl ModemInfo for MmModem {
 
 #[async_trait::async_trait]
 impl CallForward for MmModem {
-    async fn query_forward(
-        &self,
-        _default_region: &str,
-    ) -> Result<crate::call_forward::CallForwardState, ModemError> {
-        Err(ModemError::Failed("call forward not implemented".into()))
+    async fn query_forward(&self, default_region: &str) -> Result<CallForwardState, ModemError> {
+        self.ussd_roundtrip(ussd_query(), default_region).await
     }
 
     async fn set_forward(
         &self,
-        _e164: &str,
-        _default_region: &str,
-    ) -> Result<crate::call_forward::CallForwardState, ModemError> {
-        Err(ModemError::Failed("call forward not implemented".into()))
+        e164: &str,
+        default_region: &str,
+    ) -> Result<CallForwardState, ModemError> {
+        let e164 = normalize_e164(e164, default_region)
+            .map_err(|err| ModemError::Failed(err.to_string()))?;
+        self.ussd_roundtrip(&ussd_enable(&e164), default_region)
+            .await?;
+
+        match self.query_forward(default_region).await {
+            Ok(state) => Ok(state),
+            Err(_) => Ok(CallForwardState {
+                enabled: true,
+                e164: Some(e164),
+            }),
+        }
     }
 
-    async fn disable_forward(
-        &self,
-        _default_region: &str,
-    ) -> Result<crate::call_forward::CallForwardState, ModemError> {
-        Err(ModemError::Failed("call forward not implemented".into()))
+    async fn disable_forward(&self, default_region: &str) -> Result<CallForwardState, ModemError> {
+        self.ussd_roundtrip(ussd_disable(), default_region).await?;
+
+        match self.query_forward(default_region).await {
+            Ok(state) => Ok(state),
+            Err(_) => Ok(CallForwardState {
+                enabled: false,
+                e164: None,
+            }),
+        }
     }
 }
 
