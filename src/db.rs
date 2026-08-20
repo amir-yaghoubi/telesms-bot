@@ -487,6 +487,18 @@ impl Db {
     }
 
     #[cfg(test)]
+    pub fn inbound_thread_id(&self, path: &str) -> Result<Option<i32>, DbError> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT thread_id FROM inbound_log WHERE mm_path = ?1",
+            [path],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    #[cfg(test)]
     pub(crate) fn insert_inbound_at(
         &self,
         path: &str,

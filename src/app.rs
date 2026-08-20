@@ -11,7 +11,7 @@ use crate::modem::{IncomingSms, ModemError, ModemInfo, SmsInbox, SmsModem};
 use crate::actions::ActionError;
 use crate::modem_mm::MmModem;
 use crate::normalize::normalize_e164;
-use crate::route::{plan_outbound, route_inbound, InboundDest, OutboundPlan, GENERAL_THREAD};
+use crate::route::{plan_outbound, route_for_send, route_inbound, InboundDest, OutboundPlan, GENERAL_THREAD};
 
 #[derive(Debug, Error)]
 pub enum AppError {
@@ -303,7 +303,7 @@ pub async fn handle_incoming(
             ts = %sms.timestamp,
             "skip stale inbound sms"
         );
-        let thread_id = match route_inbound(db, &id_e164)? {
+        let thread_id = match route_for_send(db, &id_e164)? {
             InboundDest::ExistingTopic { thread_id, .. } => thread_id,
             InboundDest::CreateContactTopic { .. } | InboundDest::General { .. } => GENERAL_THREAD,
         };
@@ -676,6 +676,49 @@ mod tests {
         .unwrap();
         assert!(tg.posts.lock().unwrap().is_empty());
         assert!(db.seen_sms_path("/sms/old").unwrap());
+    }
+
+    #[tokio::test]
+    async fn stale_inbound_resolves_thread_without_switching_default() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db.upsert_contact("people/a", "Ali").unwrap();
+        let a = "+989120000001";
+        let b = "+989120000002";
+        db.replace_contact_numbers(id, &[a.into(), b.into()])
+            .unwrap();
+        db.upsert_topic(&Topic {
+            thread_id: 42,
+            contact_id: Some(id),
+            default_e164: Some(a.into()),
+            title: "Ali (0001)".into(),
+            ignored: false,
+        })
+        .unwrap();
+        let tg = FakeTg::new();
+        handle_incoming(
+            &db,
+            "IR",
+            IncomingSms {
+                path: "/sms/stale-b".into(),
+                e164: b.into(),
+                text: "stale from B".into(),
+                inbound: true,
+                timestamp: "2024-12-21T15:12:23+03:30".into(),
+            },
+            &tg,
+        )
+        .await
+        .unwrap();
+        assert!(tg.posts.lock().unwrap().is_empty());
+        assert_eq!(
+            db.get_topic_by_thread(42)
+                .unwrap()
+                .unwrap()
+                .default_e164
+                .as_deref(),
+            Some(a)
+        );
+        assert_eq!(db.inbound_thread_id("/sms/stale-b").unwrap(), Some(42));
     }
 
     #[tokio::test]
