@@ -109,10 +109,12 @@ impl Db {
         let _ = conn.execute("ALTER TABLE inbound_log ADD COLUMN sms_ts TEXT", []);
         let _ = conn.execute("ALTER TABLE inbound_log ADD COLUMN thread_id INTEGER", []);
         let _ = conn.execute("ALTER TABLE outbound_log ADD COLUMN thread_id INTEGER", []);
-        Ok(Db {
+        let db = Db {
             conn: Mutex::new(conn),
             contacts_available: AtomicBool::new(true),
-        })
+        };
+        db.backfill_thread_ids()?;
+        Ok(db)
     }
 
     pub fn set_contacts_available(&self, available: bool) {
@@ -486,6 +488,56 @@ impl Db {
         Ok(())
     }
 
+    pub fn backfill_thread_ids(&self) -> Result<u64, DbError> {
+        let conn = self.conn()?;
+        let mut updated = 0u64;
+        updated += conn.execute(
+            "UPDATE inbound_log
+             SET thread_id = (
+               SELECT t.thread_id FROM topics t
+               WHERE t.default_e164 = inbound_log.e164
+               ORDER BY t.thread_id ASC LIMIT 1
+             )
+             WHERE thread_id IS NULL",
+            [],
+        )? as u64;
+        updated += conn.execute(
+            "UPDATE inbound_log
+             SET thread_id = (
+               SELECT t.thread_id
+               FROM contact_numbers n
+               JOIN topics t ON t.contact_id = n.contact_id
+               WHERE n.e164 = inbound_log.e164
+               ORDER BY t.thread_id ASC LIMIT 1
+             )
+             WHERE thread_id IS NULL",
+            [],
+        )? as u64;
+        updated += conn.execute(
+            "UPDATE outbound_log
+             SET thread_id = (
+               SELECT t.thread_id FROM topics t
+               WHERE t.default_e164 = outbound_log.e164
+               ORDER BY t.thread_id ASC LIMIT 1
+             )
+             WHERE thread_id IS NULL",
+            [],
+        )? as u64;
+        updated += conn.execute(
+            "UPDATE outbound_log
+             SET thread_id = (
+               SELECT t.thread_id
+               FROM contact_numbers n
+               JOIN topics t ON t.contact_id = n.contact_id
+               WHERE n.e164 = outbound_log.e164
+               ORDER BY t.thread_id ASC LIMIT 1
+             )
+             WHERE thread_id IS NULL",
+            [],
+        )? as u64;
+        Ok(updated)
+    }
+
     #[cfg(test)]
     pub fn inbound_thread_id(&self, path: &str) -> Result<Option<i32>, DbError> {
         let conn = self.conn()?;
@@ -786,5 +838,54 @@ mod tests {
             .query_row("SELECT thread_id FROM outbound_log LIMIT 1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(tid, 7);
+    }
+
+    #[test]
+    fn backfill_assigns_topic_and_leaves_unknown_null() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db.upsert_contact("people/a", "Ali").unwrap();
+        db.replace_contact_numbers(id, &["+989121111111".into()])
+            .unwrap();
+        db.upsert_topic(&Topic {
+            thread_id: 42,
+            contact_id: Some(id),
+            default_e164: Some("+989121111111".into()),
+            title: "Ali".into(),
+            ignored: false,
+        })
+        .unwrap();
+
+        // Insert pre-migration style rows: thread_id NULL via raw SQL
+        {
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "INSERT INTO inbound_log (mm_path, e164, body, created_at, sms_ts, thread_id)
+                 VALUES ('/a', '+989121111111', 'hi', '2026-08-01T00:00:00Z', '', NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO outbound_log (e164, body, result, created_at, thread_id)
+                 VALUES ('+989129999999', 'x', 'ok', '2026-08-01T00:00:00Z', NULL)",
+                [],
+            )
+            .unwrap();
+        }
+
+        db.backfill_thread_ids().unwrap();
+
+        let conn = db.conn().unwrap();
+        let in_tid: Option<i32> = conn
+            .query_row(
+                "SELECT thread_id FROM inbound_log WHERE mm_path = '/a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(in_tid, Some(42));
+        let out_tid: Option<i32> = conn
+            .query_row("SELECT thread_id FROM outbound_log LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(out_tid, None); // unknown number stays NULL → COALESCE to General at query time
     }
 }
