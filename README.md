@@ -167,7 +167,8 @@ On the machine that owns the stick, you can skip native run and use
 | `/who` | Contact topic | Name, numbers, current default |
 | `/number` | Contact topic | Buttons to set the default number |
 | `/ignore` | Contact / General | Stop auto-creating a topic for a number |
-| `/status` | Any topic or a DM with the bot | Modem, SIM, today’s counts, last in/out |
+| `/forward` | Any topic or a DM with the bot | Interactive: set or disable unconditional call forwarding |
+| `/status` | Any topic or a DM with the bot | Modem, SIM, call forward line, today’s counts, last in/out |
 
 Typing in a contact topic sends SMS to that contact’s default number.
 
@@ -202,6 +203,8 @@ Then open `http://localhost:8080`.
 | `/api/v1/who` | POST | Contact name, numbers, default |
 | `/api/v1/number` | POST | List or set the default number |
 | `/api/v1/ignore` | POST | Ignore a number |
+| `/api/v1/call-forward` | GET | Current unconditional forward |
+| `/api/v1/call-forward` | PUT | Set `e164` or `null` to disable |
 | `/api/v1/chats` | GET | Recent chats with SMS activity |
 | `/api/v1/chats/{thread_id}/messages` | GET | SMS timeline for a forum thread |
 
