@@ -117,9 +117,28 @@ async fn run_daemon() {
     ));
 
     let info: Arc<dyn telesms_bot::modem::ModemInfo> = mm.clone();
+
+    if cfg.api_enabled() {
+        let bind: std::net::SocketAddr = format!("{}:{}", cfg.api_bind, cfg.api_port)
+            .parse()
+            .expect("API_BIND/API_PORT");
+        let state = telesms_bot::http::HttpState {
+            cfg: cfg.clone(),
+            db: db.clone(),
+            modem: modem.clone(),
+            info: info.clone(),
+            tg: tg.clone(),
+        };
+        let cancel_http = cancel.clone();
+        tasks.spawn(async move {
+            tracing::info!(%bind, "http api listening");
+            telesms_bot::http::serve(state, bind, cancel_http).await;
+        });
+    }
+
     tasks.spawn(watch_modem(
         info.clone(),
-        tg,
+        tg.clone(),
         Duration::from_secs(5),
         cancel.clone(),
     ));

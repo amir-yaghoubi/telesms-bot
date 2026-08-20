@@ -173,6 +173,26 @@ Typing in a contact topic sends SMS to that contact’s default number.
 
 ---
 
+## HTTP API
+
+When `API_KEY` is set in the environment, the daemon also listens for JSON
+requests on `0.0.0.0:8787` (override with `API_BIND` / `API_PORT`). Send the
+key in the `X-Api-Key` header. Full request/response shapes are in
+[docs/superpowers/specs/2026-08-20-http-api-design.md](docs/superpowers/specs/2026-08-20-http-api-design.md).
+
+| Route | Method | What it does |
+|---|---|---|
+| `/health` | GET | Liveness (no auth) |
+| `/api/v1/status` | GET | Modem and today’s counts (same as `/status`) |
+| `/api/v1/sms` | POST | Send SMS |
+| `/api/v1/search` | POST | Search Google contacts |
+| `/api/v1/open` | POST | Create or open a contact topic |
+| `/api/v1/who` | POST | Contact name, numbers, default |
+| `/api/v1/number` | POST | List or set the default number |
+| `/api/v1/ignore` | POST | Ignore a number |
+
+---
+
 ## Configuration
 
 Required and common variables (see `.env.example`):
