@@ -62,6 +62,19 @@ pub(crate) fn status_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new([[InlineKeyboardButton::callback("🔄 Refresh", "st:r")]])
 }
 
+pub(crate) fn forward_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new([
+        vec![
+            InlineKeyboardButton::callback("Pick contact", "cf:search"),
+            InlineKeyboardButton::callback("Type number", "cf:type"),
+        ],
+        vec![
+            InlineKeyboardButton::callback("Disable", "cf:off"),
+            InlineKeyboardButton::callback("Cancel", "cf:cancel"),
+        ],
+    ])
+}
+
 pub(crate) fn number_keyboard(numbers: &[String]) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(numbers.iter().map(|n| {
         [InlineKeyboardButton::callback(
@@ -85,6 +98,24 @@ pub(crate) fn search_keyboard(hits: &[Contact]) -> InlineKeyboardMarkup {
         [InlineKeyboardButton::callback(
             button_label(&c.display_name),
             format!("open:{}", c.id),
+        )]
+    }))
+}
+
+pub(crate) fn forward_search_keyboard(hits: &[Contact]) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(hits.iter().take(20).map(|c| {
+        [InlineKeyboardButton::callback(
+            button_label(&c.display_name),
+            format!("cf:c:{}", c.id),
+        )]
+    }))
+}
+
+pub(crate) fn forward_number_keyboard(numbers: &[String]) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(numbers.iter().map(|n| {
+        [InlineKeyboardButton::callback(
+            n.clone(),
+            format!("cf:n:{n}"),
         )]
     }))
 }

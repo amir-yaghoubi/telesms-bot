@@ -1,12 +1,15 @@
 use super::handlers::{
     handle_help, handle_ignore, handle_num_callback, handle_number_empty_or_list, handle_open,
-    handle_search, handle_sms, handle_who,
+    handle_pending_forward_text, handle_search, handle_sms, handle_who,
 };
-use super::keyboards::{inline_answer_articles, inline_articles, search_keyboard};
+use super::keyboards::{
+    forward_keyboard, inline_answer_articles, inline_articles, search_keyboard,
+};
 use super::parse::{
-    allow_dm_callback, allowed, bot_commands, format_who, help_text, is_owner_dm, parse_cmd_name,
-    parse_ignore_reply, parse_num_callback, parse_open_callback, parse_open_cmd,
-    parse_search_query, parse_sms_cmd, parse_status_refresh, topic_open_message,
+    allow_dm_callback, allowed, bot_commands, format_who, help_text, is_owner_dm,
+    parse_cf_callback, parse_cmd_name, parse_ignore_reply, parse_num_callback, parse_open_callback,
+    parse_open_cmd, parse_search_query, parse_sms_cmd, parse_status_refresh, topic_open_message,
+    CfAction,
 };
 use super::util::{edit_failed_is_noop, forum_thread};
 use crate::app::FakeTg;
@@ -62,6 +65,62 @@ fn parse_sms_splits_number_and_rest() {
 #[test]
 fn parse_sms_rejects_bare() {
     assert!(parse_sms_cmd("/sms").is_none());
+}
+
+#[test]
+fn bot_commands_include_forward() {
+    assert!(bot_commands().iter().any(|c| c.command == "forward"));
+}
+
+#[test]
+fn parse_cf_callbacks() {
+    assert_eq!(parse_cf_callback("cf:off"), Some(CfAction::Disable));
+    assert_eq!(parse_cf_callback("cf:cancel"), Some(CfAction::Cancel));
+    assert_eq!(parse_cf_callback("cf:type"), Some(CfAction::TypeNumber));
+    assert_eq!(parse_cf_callback("cf:search"), Some(CfAction::Search));
+    assert_eq!(parse_cf_callback("cf:c:42"), Some(CfAction::Contact(42)));
+    assert_eq!(
+        parse_cf_callback("cf:n:+989121234567"),
+        Some(CfAction::Number("+989121234567".into()))
+    );
+}
+
+#[test]
+fn help_mentions_forward() {
+    assert!(help_text().contains("/forward"));
+}
+
+#[test]
+fn forward_keyboard_has_four_actions() {
+    let keyboard = forward_keyboard();
+    assert_eq!(keyboard.inline_keyboard.len(), 2);
+    assert_eq!(
+        keyboard.inline_keyboard.iter().map(Vec::len).sum::<usize>(),
+        4
+    );
+}
+
+#[tokio::test]
+async fn pending_forward_number_consumes_text_and_clears_pending() {
+    use crate::db::PendingForwardMode;
+
+    let db = Db::open_in_memory().unwrap();
+    db.set_pending_forward(9, PendingForwardMode::Number, -100, 77)
+        .unwrap();
+    let modem = FakeModem::default();
+
+    let result = handle_pending_forward_text(&db, "IR", 9, "09121234567", &modem)
+        .await
+        .unwrap()
+        .expect("pending input handled");
+
+    assert_eq!(result.pending.edit_message_id, 77);
+    assert!(result.state.unwrap().enabled);
+    assert_eq!(
+        modem.forward.lock().unwrap().e164.as_deref(),
+        Some("+989121234567")
+    );
+    assert!(db.get_pending_forward(9).unwrap().is_none());
 }
 
 #[test]
@@ -146,7 +205,9 @@ async fn who_in_contact_topic_lists_numbers() {
 async fn number_empty_posts_no_numbers() {
     let db = Db::open_in_memory().unwrap();
     let tg = FakeTg::new();
-    let numbers = handle_number_empty_or_list(&db, "IR", 1, &tg).await.unwrap();
+    let numbers = handle_number_empty_or_list(&db, "IR", 1, &tg)
+        .await
+        .unwrap();
     assert!(numbers.is_empty());
     assert_eq!(
         tg.posts.lock().unwrap().as_slice(),
@@ -700,7 +761,7 @@ fn bot_commands_are_the_forum_menu() {
     let names: Vec<&str> = cmds.iter().map(|c| c.command.as_str()).collect();
     assert_eq!(
         names.as_slice(),
-        &["help", "sms", "search", "who", "number", "ignore", "status"]
+        &["help", "sms", "search", "who", "number", "ignore", "forward", "status"]
     );
     assert_eq!(cmds[0].description, "How to send SMS and use this group");
     assert_eq!(cmds[1].description, "Send SMS: /sms <number> <text>");
@@ -714,7 +775,8 @@ fn bot_commands_are_the_forum_menu() {
         cmds[5].description,
         "Stop auto-creating a topic for this number"
     );
-    assert_eq!(cmds[6].description, "Modem and gateway status");
+    assert_eq!(cmds[6].description, "Manage unconditional call forwarding");
+    assert_eq!(cmds[7].description, "Modem and gateway status");
 }
 
 #[test]
@@ -744,6 +806,9 @@ SMS from this forum.
 /ignore
   Contact topic: stop auto-creating a topic for these numbers.
   General: reply to a +number message to ignore it.
+
+/forward
+  Show or change unconditional call forwarding.
 
 /status
   Modem, SIM, today's SMS counts, last in/out, contacts.

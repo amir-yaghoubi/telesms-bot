@@ -59,6 +59,7 @@ pub fn bot_commands() -> Vec<BotCommand> {
         BotCommand::new("who", "Show this topic's contact and numbers"),
         BotCommand::new("number", "Choose the default number for this topic"),
         BotCommand::new("ignore", "Stop auto-creating a topic for this number"),
+        BotCommand::new("forward", "Manage unconditional call forwarding"),
         BotCommand::new("status", "Modem and gateway status"),
     ]
 }
@@ -87,6 +88,9 @@ SMS from this forum.
   Contact topic: stop auto-creating a topic for these numbers.
   General: reply to a +number message to ignore it.
 
+/forward
+  Show or change unconditional call forwarding.
+
 /status
   Modem, SIM, today's SMS counts, last in/out, contacts.
   Works in any topic and in a private chat with the bot.
@@ -97,6 +101,33 @@ Text in General is not an SMS unless you use /sms."
 
 pub fn parse_status_refresh(data: &str) -> bool {
     data == "st:r"
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CfAction {
+    TypeNumber,
+    Search,
+    Disable,
+    Cancel,
+    Contact(i64),
+    Number(String),
+}
+
+pub fn parse_cf_callback(data: &str) -> Option<CfAction> {
+    match data {
+        "cf:type" => Some(CfAction::TypeNumber),
+        "cf:search" => Some(CfAction::Search),
+        "cf:off" => Some(CfAction::Disable),
+        "cf:cancel" => Some(CfAction::Cancel),
+        _ => {
+            if let Some(id) = data.strip_prefix("cf:c:") {
+                return id.parse().ok().map(CfAction::Contact);
+            }
+            data.strip_prefix("cf:n:")
+                .filter(|e164| !e164.is_empty())
+                .map(|e164| CfAction::Number(e164.to_string()))
+        }
+    }
 }
 
 pub fn allow_dm_callback(data: &str) -> bool {

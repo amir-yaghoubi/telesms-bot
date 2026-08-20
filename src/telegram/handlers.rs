@@ -6,20 +6,26 @@ use teloxide::error_handlers::LoggingErrorHandler;
 use teloxide::prelude::*;
 use teloxide::types::{BotCommandScope, CallbackQuery, ChatId, InlineQuery, MessageId, ParseMode};
 
-use crate::actions::{ignore, list_numbers, open_topic, search_contacts, send_sms, set_default_number, who, ActionError, Identity};
+use crate::actions::{
+    get_call_forward, ignore, list_numbers, open_topic, put_call_forward, search_contacts,
+    send_sms, set_default_number, who, ActionError, Identity,
+};
 use crate::app::{handle_owner_text, AppError, OwnerTextOutcome, TelegramSink};
+use crate::call_forward::CallForwardState;
 use crate::config::Config;
-use crate::db::{Contact, Db, Topic};
+use crate::db::{Contact, Db, PendingForward, PendingForwardMode, Topic};
 use crate::modem::{CallForward, SmsModem};
 use crate::route::GENERAL_THREAD;
 
 use super::keyboards::{
-    inline_answer_articles, inline_query_results, number_keyboard, search_keyboard, status_keyboard,
+    forward_keyboard, forward_number_keyboard, forward_search_keyboard, inline_answer_articles,
+    inline_query_results, number_keyboard, search_keyboard, status_keyboard,
 };
 use super::parse::{
-    allow_dm_callback, allowed, bot_commands, format_who, help_text, is_owner_dm, parse_cmd_name,
-    parse_ignore_reply, parse_num_callback, parse_open_callback, parse_open_cmd,
-    parse_search_query, parse_sms_cmd, parse_status_refresh, topic_open_message,
+    allow_dm_callback, allowed, bot_commands, format_who, help_text, is_owner_dm,
+    parse_cf_callback, parse_cmd_name, parse_ignore_reply, parse_num_callback, parse_open_callback,
+    parse_open_cmd, parse_search_query, parse_sms_cmd, parse_status_refresh, topic_open_message,
+    CfAction,
 };
 use super::sink::RealTg;
 use super::util::{edit_failed_is_noop, forum_thread, thread_id_i32};
@@ -317,6 +323,164 @@ pub async fn handle_sms(
     }
 }
 
+pub(crate) struct PendingForwardTextResult {
+    pub pending: PendingForward,
+    pub state: Option<CallForwardState>,
+    pub hits: Vec<Contact>,
+    pub message: String,
+}
+
+pub(crate) async fn handle_pending_forward_text(
+    db: &Db,
+    region: &str,
+    thread_id: i32,
+    text: &str,
+    forward: &dyn CallForward,
+) -> Result<Option<PendingForwardTextResult>, AppError> {
+    let Some(pending) = db.take_pending_forward(thread_id)? else {
+        return Ok(None);
+    };
+    let result = match pending.mode {
+        PendingForwardMode::Number => {
+            match put_call_forward(forward, region, Some(text.into())).await {
+                Ok(state) => PendingForwardTextResult {
+                    pending,
+                    state: Some(state),
+                    hits: Vec::new(),
+                    message: String::new(),
+                },
+                Err(ActionError::Db(err)) => return Err(err.into()),
+                Err(err) => PendingForwardTextResult {
+                    pending,
+                    state: None,
+                    hits: Vec::new(),
+                    message: format!("Could not set forwarding: {err}"),
+                },
+            }
+        }
+        PendingForwardMode::Search => match search_contacts(db, text) {
+            Ok(hits) if hits.is_empty() => PendingForwardTextResult {
+                pending,
+                state: None,
+                hits,
+                message: "No matching contacts.".into(),
+            },
+            Ok(hits) => PendingForwardTextResult {
+                pending,
+                state: None,
+                hits,
+                message: "Pick a contact.".into(),
+            },
+            Err(ActionError::Db(err)) => return Err(err.into()),
+            Err(err) => PendingForwardTextResult {
+                pending,
+                state: None,
+                hits: Vec::new(),
+                message: format!("Could not search contacts: {err}"),
+            },
+        },
+    };
+    Ok(Some(result))
+}
+
+fn forward_card_text(db: &Db, state: &CallForwardState) -> Result<String, AppError> {
+    let line = if state.enabled {
+        let e164 = state.e164.as_deref().unwrap_or("unknown");
+        let label = db
+            .find_contact_by_e164(e164)?
+            .map(|contact| contact.display_name)
+            .unwrap_or_else(|| e164.to_string());
+        format!("↪️ Forward · {}", crate::status::html_escape(&label))
+    } else {
+        "↪️ Forward · off".into()
+    };
+    Ok(format!(
+        "<b>Call forwarding</b>\n{line}\n\nChoose an action."
+    ))
+}
+
+async fn edit_forward_card(
+    bot: &Bot,
+    chat_id: ChatId,
+    message_id: MessageId,
+    text: String,
+    keyboard: teloxide::types::InlineKeyboardMarkup,
+) -> Result<(), AppError> {
+    let request = bot
+        .edit_message_text(chat_id, message_id, text)
+        .parse_mode(ParseMode::Html)
+        .reply_markup(keyboard);
+    match request.await {
+        Ok(_) => Ok(()),
+        Err(err) if edit_failed_is_noop(&err) => Ok(()),
+        Err(err) => Err(AppError::Telegram(err.to_string())),
+    }
+}
+
+async fn edit_forward_result(
+    bot: &Bot,
+    db: &Db,
+    chat_id: ChatId,
+    message_id: MessageId,
+    result: Result<CallForwardState, ActionError>,
+) -> Result<(), AppError> {
+    match result {
+        Ok(state) => {
+            edit_forward_card(
+                bot,
+                chat_id,
+                message_id,
+                forward_card_text(db, &state)?,
+                forward_keyboard(),
+            )
+            .await
+        }
+        Err(ActionError::Db(err)) => Err(err.into()),
+        Err(err) => {
+            let text = format!(
+                "<b>Call forwarding</b>\n{}\n\nChoose an action.",
+                crate::status::html_escape(&format!("Operation failed: {err}"))
+            );
+            edit_forward_card(bot, chat_id, message_id, text, forward_keyboard()).await
+        }
+    }
+}
+
+async fn send_forward_card(
+    bot: &Bot,
+    chat_id: ChatId,
+    thread_id: i32,
+    db: &Db,
+    forward: &dyn CallForward,
+    region: &str,
+) -> Result<(), AppError> {
+    let state = match get_call_forward(forward, region).await {
+        Ok(state) => state,
+        Err(err) => {
+            let text = format!("Call forwarding unavailable: {err}");
+            let mut request = bot.send_message(chat_id, text);
+            if let Some(thread) = forum_thread(thread_id) {
+                request = request.message_thread_id(thread);
+            }
+            request
+                .await
+                .map_err(|error| AppError::Telegram(error.to_string()))?;
+            return Ok(());
+        }
+    };
+    let mut request = bot
+        .send_message(chat_id, forward_card_text(db, &state)?)
+        .parse_mode(ParseMode::Html)
+        .reply_markup(forward_keyboard());
+    if let Some(thread) = forum_thread(thread_id) {
+        request = request.message_thread_id(thread);
+    }
+    request
+        .await
+        .map_err(|error| AppError::Telegram(error.to_string()))?;
+    Ok(())
+}
+
 async fn post_status(
     bot: &Bot,
     chat_id: ChatId,
@@ -479,6 +643,35 @@ async fn on_message(
         bot: bot.clone(),
         chat_id: ChatId(cfg.telegram_group_id),
     };
+    if let Some(result) =
+        handle_pending_forward_text(&db, &cfg.default_region, thread_id, text, forward.as_ref())
+            .await?
+    {
+        let chat_id = ChatId(result.pending.edit_chat_id);
+        let message_id = MessageId(result.pending.edit_message_id);
+        if let Some(state) = result.state {
+            edit_forward_card(
+                &bot,
+                chat_id,
+                message_id,
+                forward_card_text(&db, &state)?,
+                forward_keyboard(),
+            )
+            .await?;
+        } else {
+            let keyboard = if result.hits.is_empty() {
+                forward_keyboard()
+            } else {
+                forward_search_keyboard(&result.hits)
+            };
+            let text = format!(
+                "<b>Call forwarding</b>\n{}\n\nChoose an action.",
+                crate::status::html_escape(&result.message)
+            );
+            edit_forward_card(&bot, chat_id, message_id, text, keyboard).await?;
+        }
+        return Ok(());
+    }
     if let Some((raw, body)) = parse_sms_cmd(text) {
         handle_sms(
             &db,
@@ -507,6 +700,17 @@ async fn on_message(
         Some("ignore") => {
             let reply = msg.reply_to_message().and_then(|m| m.text());
             handle_ignore(&db, &cfg.default_region, thread_id, reply, &tg).await?;
+        }
+        Some("forward") => {
+            send_forward_card(
+                &bot,
+                tg.chat_id,
+                thread_id,
+                &db,
+                forward.as_ref(),
+                &cfg.default_region,
+            )
+            .await?;
         }
         Some("search") => {
             let q = parse_search_query(text).unwrap_or("");
@@ -606,7 +810,132 @@ async fn on_callback(
         )
         .await;
     }
-    if let Some(e164) = parse_num_callback(data) {
+    if let Some(action) = parse_cf_callback(data) {
+        let Some(message) = q.regular_message() else {
+            return Ok(());
+        };
+        let chat_id = message.chat.id;
+        let message_id = message.id;
+        match action {
+            CfAction::TypeNumber => {
+                db.set_pending_forward(
+                    thread_id,
+                    PendingForwardMode::Number,
+                    chat_id.0,
+                    message_id.0,
+                )?;
+                edit_forward_card(
+                    &bot,
+                    chat_id,
+                    message_id,
+                    "<b>Call forwarding</b>\nSend the number to forward calls to.".to_string(),
+                    forward_keyboard(),
+                )
+                .await
+            }
+            CfAction::Search => {
+                db.set_pending_forward(
+                    thread_id,
+                    PendingForwardMode::Search,
+                    chat_id.0,
+                    message_id.0,
+                )?;
+                edit_forward_card(
+                    &bot,
+                    chat_id,
+                    message_id,
+                    "<b>Call forwarding</b>\nSend a contact name to search.".to_string(),
+                    forward_keyboard(),
+                )
+                .await
+            }
+            CfAction::Disable => {
+                db.clear_pending_forward(thread_id)?;
+                edit_forward_result(
+                    &bot,
+                    &db,
+                    chat_id,
+                    message_id,
+                    put_call_forward(forward.as_ref(), &cfg.default_region, None).await,
+                )
+                .await
+            }
+            CfAction::Cancel => {
+                db.clear_pending_forward(thread_id)?;
+                edit_forward_result(
+                    &bot,
+                    &db,
+                    chat_id,
+                    message_id,
+                    get_call_forward(forward.as_ref(), &cfg.default_region).await,
+                )
+                .await
+            }
+            CfAction::Contact(contact_id) => {
+                let Some(contact) = db.get_contact(contact_id)? else {
+                    return edit_forward_card(
+                        &bot,
+                        chat_id,
+                        message_id,
+                        "<b>Call forwarding</b>\nUnknown contact.\n\nChoose an action.".to_string(),
+                        forward_keyboard(),
+                    )
+                    .await;
+                };
+                match contact.numbers.as_slice() {
+                    [] => {
+                        edit_forward_card(
+                            &bot,
+                            chat_id,
+                            message_id,
+                            "<b>Call forwarding</b>\nThis contact has no phone numbers.\n\nChoose an action."
+                                .to_string(),
+                            forward_keyboard(),
+                        )
+                        .await
+                    }
+                    [e164] => {
+                        edit_forward_result(
+                            &bot,
+                            &db,
+                            chat_id,
+                            message_id,
+                            put_call_forward(
+                                forward.as_ref(),
+                                &cfg.default_region,
+                                Some(e164.clone()),
+                            )
+                            .await,
+                        )
+                        .await
+                    }
+                    numbers => {
+                        edit_forward_card(
+                            &bot,
+                            chat_id,
+                            message_id,
+                            format!(
+                                "<b>Call forwarding</b>\nPick a number for {}.",
+                                crate::status::html_escape(&contact.display_name)
+                            ),
+                            forward_number_keyboard(numbers),
+                        )
+                        .await
+                    }
+                }
+            }
+            CfAction::Number(e164) => {
+                edit_forward_result(
+                    &bot,
+                    &db,
+                    chat_id,
+                    message_id,
+                    put_call_forward(forward.as_ref(), &cfg.default_region, Some(e164)).await,
+                )
+                .await
+            }
+        }
+    } else if let Some(e164) = parse_num_callback(data) {
         handle_num_callback(
             &db,
             &cfg.default_region,
