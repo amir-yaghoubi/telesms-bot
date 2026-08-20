@@ -82,6 +82,29 @@ pub struct Topic {
     pub ignored: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct ChatSummary {
+    pub thread_id: i32,
+    pub title: String,
+    pub contact_id: Option<i64>,
+    pub display_name: Option<String>,
+    pub default_e164: Option<String>,
+    pub last_message_at: String,
+    pub last_message_preview: String,
+    pub last_message_direction: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct MessageRow {
+    pub id: String,
+    pub direction: String,
+    pub e164: String,
+    pub body: String,
+    pub timestamp: String,
+    pub sms_ts: Option<String>,
+    pub status: String,
+}
+
 pub struct TodaySmsCounts {
     pub inbound: u32,
     pub sent_ok: u32,
@@ -538,6 +561,115 @@ impl Db {
         Ok(updated)
     }
 
+    pub fn chats_with_activity(
+        &self,
+        limit: i64,
+        before: Option<&str>,
+        after: Option<&str>,
+    ) -> Result<Vec<ChatSummary>, DbError> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "WITH activity AS (
+               SELECT id, 'in' AS direction, body, created_at AS ts,
+                      COALESCE(thread_id, 1) AS tid
+               FROM inbound_log
+               UNION ALL
+               SELECT id, 'out', body, created_at, COALESCE(thread_id, 1)
+               FROM outbound_log
+             ),
+             ranked AS (
+               SELECT direction, body, ts, tid,
+                      ROW_NUMBER() OVER (
+                        PARTITION BY tid
+                        ORDER BY ts DESC, id DESC, direction DESC
+                      ) AS row_num
+               FROM activity
+             )
+             SELECT r.tid,
+                    COALESCE(
+                      t.title,
+                      CASE
+                        WHEN r.tid = 1 THEN 'General'
+                        ELSE 'Thread ' || r.tid
+                      END
+                    ),
+                    t.contact_id,
+                    c.display_name,
+                    t.default_e164,
+                    r.ts,
+                    r.body,
+                    r.direction
+             FROM ranked r
+             LEFT JOIN topics t ON t.thread_id = r.tid
+             LEFT JOIN contacts c ON c.id = t.contact_id
+             WHERE r.row_num = 1
+               AND (?1 IS NULL OR r.ts < ?1)
+               AND (?2 IS NULL OR r.ts > ?2)
+             ORDER BY r.ts DESC
+             LIMIT ?3",
+        )?;
+        let chats = stmt
+            .query_map(rusqlite::params![before, after, limit], |row| {
+                Ok(ChatSummary {
+                    thread_id: row.get(0)?,
+                    title: row.get(1)?,
+                    contact_id: row.get(2)?,
+                    display_name: row.get(3)?,
+                    default_e164: row.get(4)?,
+                    last_message_at: row.get(5)?,
+                    last_message_preview: row.get(6)?,
+                    last_message_direction: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(chats)
+    }
+
+    pub fn messages_for_thread(
+        &self,
+        thread_id: i32,
+        limit: i64,
+        before: Option<&str>,
+        after: Option<&str>,
+    ) -> Result<Vec<MessageRow>, DbError> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, direction, e164, body, ts, sms_ts, status
+             FROM (
+               SELECT id, 'in' AS direction, e164, body, created_at AS ts, sms_ts,
+                      'ok' AS status, COALESCE(thread_id, 1) AS tid
+               FROM inbound_log
+               UNION ALL
+               SELECT id, 'out', e164, body, created_at, NULL,
+                      CASE WHEN result = 'ok' THEN 'ok' ELSE 'failed' END,
+                      COALESCE(thread_id, 1)
+               FROM outbound_log
+             )
+             WHERE tid = ?1
+               AND (?2 IS NULL OR ts < ?2)
+               AND (?3 IS NULL OR ts > ?3)
+             ORDER BY ts DESC, id DESC
+             LIMIT ?4",
+        )?;
+        let messages = stmt
+            .query_map(rusqlite::params![thread_id, before, after, limit], |row| {
+                let id: i64 = row.get(0)?;
+                let direction: String = row.get(1)?;
+                let sms_ts: Option<String> = row.get(5)?;
+                Ok(MessageRow {
+                    id: format!("{direction}:{id}"),
+                    direction,
+                    e164: row.get(2)?,
+                    body: row.get(3)?,
+                    timestamp: row.get(4)?,
+                    sms_ts: sms_ts.filter(|value| !value.is_empty()),
+                    status: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(messages)
+    }
+
     #[cfg(test)]
     pub fn inbound_thread_id(&self, path: &str) -> Result<Option<i32>, DbError> {
         let conn = self.conn()?;
@@ -887,5 +1019,92 @@ mod tests {
             .query_row("SELECT thread_id FROM outbound_log LIMIT 1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(out_tid, None); // unknown number stays NULL → COALESCE to General at query time
+    }
+
+    #[test]
+    fn chats_with_activity_orders_and_buckets_general() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db.upsert_contact("people/a", "Ali").unwrap();
+        db.replace_contact_numbers(id, &["+989121111111".into()])
+            .unwrap();
+        db.upsert_topic(&Topic {
+            thread_id: 42,
+            contact_id: Some(id),
+            default_e164: Some("+989121111111".into()),
+            title: "Ali (1111)".into(),
+            ignored: false,
+        })
+        .unwrap();
+        db.record_inbound("/1", "+989129999999", "unknown", None, "", 1)
+            .unwrap();
+        db.record_outbound("+989121111111", "later", "ok", 42)
+            .unwrap();
+        {
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "UPDATE inbound_log SET created_at = '2026-08-20T08:00:00Z' WHERE mm_path = '/1'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE outbound_log SET created_at = '2026-08-20T09:00:00Z' WHERE thread_id = 42",
+                [],
+            )
+            .unwrap();
+        }
+
+        let chats = db.chats_with_activity(50, None, None).unwrap();
+        assert!(chats.len() >= 2);
+        assert_eq!(chats[0].thread_id, 42);
+        assert!(chats.iter().any(|c| c.thread_id == 1));
+    }
+
+    #[test]
+    fn messages_for_thread_unions_and_marks_failed() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_topic(&Topic {
+            thread_id: 42,
+            contact_id: None,
+            default_e164: Some("+98912".into()),
+            title: "X".into(),
+            ignored: false,
+        })
+        .unwrap();
+        db.record_inbound("/m1", "+98912", "hi", None, "2026-08-20T08:00:00Z", 42)
+            .unwrap();
+        db.record_outbound("+98912", "nope", "modem down", 42)
+            .unwrap();
+
+        let msgs = db.messages_for_thread(42, 50, None, None).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert!(msgs.iter().any(|m| m.direction == "in" && m.status == "ok"));
+        assert!(msgs
+            .iter()
+            .any(|m| m.direction == "out" && m.status == "failed" && m.id.starts_with("out:")));
+    }
+
+    #[test]
+    fn messages_cursor_before_excludes_boundary() {
+        let db = Db::open_in_memory().unwrap();
+        {
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "INSERT INTO inbound_log (mm_path, e164, body, created_at, sms_ts, thread_id)
+                 VALUES ('/a', '+1', 'old', '2026-08-01T00:00:00Z', '', 42)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO inbound_log (mm_path, e164, body, created_at, sms_ts, thread_id)
+                 VALUES ('/b', '+1', 'new', '2026-08-02T00:00:00Z', '', 42)",
+                [],
+            )
+            .unwrap();
+        }
+        let page = db
+            .messages_for_thread(42, 10, Some("2026-08-02T00:00:00Z"), None)
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].body, "old");
     }
 }
