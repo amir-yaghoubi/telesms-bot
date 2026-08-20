@@ -1,5 +1,5 @@
 use teloxide::prelude::*;
-use teloxide::types::{ChatId, MessageId, ReplyParameters, ThreadId};
+use teloxide::types::{ChatId, MessageId, ReactionType, ReplyParameters, ThreadId};
 
 use crate::app::{AppError, TelegramSink};
 
@@ -30,6 +30,17 @@ impl TelegramSink for RealTg {
             req = req.message_thread_id(thread);
         }
         req.await.map_err(|e| AppError::Telegram(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn react(&self, message_id: i32, emoji: &str) -> Result<(), AppError> {
+        self.bot
+            .set_message_reaction(self.chat_id, MessageId(message_id))
+            .reaction(vec![ReactionType::Emoji {
+                emoji: emoji.to_string(),
+            }])
+            .await
+            .map_err(|e| AppError::Telegram(e.to_string()))?;
         Ok(())
     }
 
