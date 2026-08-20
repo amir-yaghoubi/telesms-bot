@@ -219,10 +219,28 @@ impl PathCache {
 }
 
 #[derive(Clone)]
+struct CallForwardLock {
+    inner: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl CallForwardLock {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+
+    async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.inner.lock().await
+    }
+}
+
+#[derive(Clone)]
 pub struct MmModem {
     conn: Connection,
     uid: String,
     cached_path: PathCache,
+    call_forward_lock: CallForwardLock,
 }
 
 impl MmModem {
@@ -237,6 +255,7 @@ impl MmModem {
             conn,
             uid,
             cached_path: PathCache::new(),
+            call_forward_lock: CallForwardLock::new(),
         })
     }
 
@@ -592,6 +611,7 @@ impl ModemInfo for MmModem {
 #[async_trait::async_trait]
 impl CallForward for MmModem {
     async fn query_forward(&self, default_region: &str) -> Result<CallForwardState, ModemError> {
+        let _guard = self.call_forward_lock.lock().await;
         self.ussd_roundtrip(ussd_query(), default_region).await
     }
 
@@ -600,12 +620,13 @@ impl CallForward for MmModem {
         e164: &str,
         default_region: &str,
     ) -> Result<CallForwardState, ModemError> {
+        let _guard = self.call_forward_lock.lock().await;
         let e164 = normalize_e164(e164, default_region)
             .map_err(|err| ModemError::Failed(err.to_string()))?;
         self.ussd_roundtrip(&ussd_enable(&e164), default_region)
             .await?;
 
-        match self.query_forward(default_region).await {
+        match self.ussd_roundtrip(ussd_query(), default_region).await {
             Ok(state) => Ok(state),
             Err(_) => Ok(CallForwardState {
                 enabled: true,
@@ -615,9 +636,10 @@ impl CallForward for MmModem {
     }
 
     async fn disable_forward(&self, default_region: &str) -> Result<CallForwardState, ModemError> {
+        let _guard = self.call_forward_lock.lock().await;
         self.ussd_roundtrip(ussd_disable(), default_region).await?;
 
-        match self.query_forward(default_region).await {
+        match self.ussd_roundtrip(ussd_query(), default_region).await {
             Ok(state) => Ok(state),
             Err(_) => Ok(CallForwardState {
                 enabled: false,
@@ -725,5 +747,21 @@ mod tests {
             "org.freedesktop.DBus.Error.UnknownObject".into()
         )));
         assert!(cache.hit().is_none());
+    }
+
+    #[tokio::test]
+    async fn call_forward_lock_serializes_clones() {
+        let lock = CallForwardLock::new();
+        let clone = lock.clone();
+        let first = lock.lock().await;
+
+        let waiter = tokio::spawn(async move {
+            let _guard = clone.lock().await;
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        drop(first);
+        waiter.await.unwrap();
     }
 }
