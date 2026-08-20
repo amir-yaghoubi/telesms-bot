@@ -150,7 +150,9 @@ pub async fn watch_inbox<I>(
     }
 }
 
+pub const SEND_PENDING: &str = "📨";
 pub const SEND_ACK: &str = "✅";
+pub const SEND_FAIL: &str = "❌";
 
 #[async_trait::async_trait]
 pub trait TelegramSink: Send + Sync {
@@ -158,12 +160,16 @@ pub trait TelegramSink: Send + Sync {
     async fn reply(&self, thread_id: i32, text: String, _reply_to: i32) -> Result<(), AppError> {
         self.post(thread_id, text).await
     }
+    async fn react(&self, _message_id: i32, _emoji: &str) -> Result<(), AppError> {
+        Err(AppError::Telegram("react not supported".into()))
+    }
     async fn create_topic(&self, title: String) -> Result<i32, AppError>;
 }
 
 pub struct FakeTg {
     pub posts: Mutex<Vec<(i32, String)>>,
     pub replies: Mutex<Vec<(i32, String, i32)>>,
+    pub reactions: Mutex<Vec<(i32, String)>>,
     pub next_thread: AtomicI32,
     pub fail: bool,
 }
@@ -173,6 +179,7 @@ impl FakeTg {
         Self {
             posts: Mutex::new(Vec::new()),
             replies: Mutex::new(Vec::new()),
+            reactions: Mutex::new(Vec::new()),
             next_thread: AtomicI32::new(100),
             fail: false,
         }
@@ -206,6 +213,17 @@ impl TelegramSink for FakeTg {
             .lock()
             .expect("fake tg replies lock")
             .push((thread_id, text, reply_to));
+        Ok(())
+    }
+
+    async fn react(&self, message_id: i32, emoji: &str) -> Result<(), AppError> {
+        if self.fail {
+            return Err(AppError::Telegram("fail".into()));
+        }
+        self.reactions
+            .lock()
+            .expect("fake tg reactions lock")
+            .push((message_id, emoji.to_string()));
         Ok(())
     }
 
@@ -826,6 +844,17 @@ mod tests {
         assert_eq!(
             tg.posts.lock().unwrap().as_slice(),
             &[(GENERAL_THREAD, "modem offline".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_tg_react_records_emoji() {
+        let tg = FakeTg::new();
+        tg.react(7, SEND_PENDING).await.unwrap();
+        tg.react(7, SEND_ACK).await.unwrap();
+        assert_eq!(
+            tg.reactions.lock().unwrap().as_slice(),
+            &[(7, SEND_PENDING.into()), (7, SEND_ACK.into())]
         );
     }
 
