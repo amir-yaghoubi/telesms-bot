@@ -337,6 +337,10 @@ pub(crate) async fn handle_pending_forward_text(
     text: &str,
     forward: &dyn CallForward,
 ) -> Result<Option<PendingForwardTextResult>, AppError> {
+    if parse_cmd_name(text).is_some() {
+        db.clear_pending_forward(thread_id)?;
+        return Ok(None);
+    }
     let Some(pending) = db.take_pending_forward(thread_id)? else {
         return Ok(None);
     };
@@ -491,33 +495,32 @@ async fn post_status(
     cfg: &Config,
     edit: Option<MessageId>,
 ) -> Result<(), AppError> {
-    let html =
-        match crate::status::gather(
-            info,
-            forward,
-            &cfg.default_region,
-            db,
-            cfg.status_tz,
-            &cfg.modem_uid,
-            chrono::Utc::now(),
-        )
-        .await
-        {
-            Ok(snap) => crate::status::format_status_html(&snap),
-            Err(err) => {
-                let text = format!("status failed: {err}");
-                if let Some(id) = edit {
-                    let _ = bot.edit_message_text(chat_id, id, &text).await;
-                } else {
-                    let mut req = bot.send_message(chat_id, text);
-                    if let Some(thread) = forum_thread(thread_id) {
-                        req = req.message_thread_id(thread);
-                    }
-                    req.await.map_err(|e| AppError::Telegram(e.to_string()))?;
+    let html = match crate::status::gather(
+        info,
+        Some(forward),
+        &cfg.default_region,
+        db,
+        cfg.status_tz,
+        &cfg.modem_uid,
+        chrono::Utc::now(),
+    )
+    .await
+    {
+        Ok(snap) => crate::status::format_status_html(&snap),
+        Err(err) => {
+            let text = format!("status failed: {err}");
+            if let Some(id) = edit {
+                let _ = bot.edit_message_text(chat_id, id, &text).await;
+            } else {
+                let mut req = bot.send_message(chat_id, text);
+                if let Some(thread) = forum_thread(thread_id) {
+                    req = req.message_thread_id(thread);
                 }
-                return Ok(());
+                req.await.map_err(|e| AppError::Telegram(e.to_string()))?;
             }
-        };
+            return Ok(());
+        }
+    };
     if let Some(id) = edit {
         let req = bot
             .edit_message_text(chat_id, id, html.clone())

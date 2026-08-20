@@ -26,9 +26,11 @@ pub fn parse_ussd_reply(text: &str, default_region: &str) -> Result<CallForwardS
     let lower = text.to_ascii_lowercase();
     let disabled_markers = [
         "not forwarded",
+        "not activated",
         "deactivated",
         "disabled",
         "not active",
+        "inactive",
         "erased",
         "cancelled",
         "canceled",
@@ -38,6 +40,12 @@ pub fn parse_ussd_reply(text: &str, default_region: &str) -> Result<CallForwardS
             enabled: false,
             e164: None,
         });
+    }
+
+    let enabled_markers = ["forwarded", "activated", "active", "unconditional"];
+    let looks_enabled = enabled_markers.iter().any(|m| lower.contains(m));
+    if !looks_enabled {
+        return Err(format!("unparseable ussd reply: {text}"));
     }
 
     // Prefer +E.164, else a long digit run (normalize).
@@ -56,11 +64,9 @@ pub fn parse_ussd_reply(text: &str, default_region: &str) -> Result<CallForwardS
         });
     }
 
-    let enabled_markers = ["forwarded", "activated", "active", "unconditional"];
-    if enabled_markers.iter().any(|m| lower.contains(m)) {
-        return Err(format!("ussd reply looks enabled but has no number: {text}"));
-    }
-    Err(format!("unparseable ussd reply: {text}"))
+    Err(format!(
+        "ussd reply looks enabled but has no number: {text}"
+    ))
 }
 
 fn extract_plus_number(text: &str) -> Option<String> {
@@ -120,6 +126,8 @@ mod tests {
             "CFU deactivated",
             "not forwarded",
             "disabled",
+            "Call forwarding not activated for 09121234567",
+            "Call forwarding inactive for 09121234567",
         ] {
             let st = parse_ussd_reply(s, "IR").unwrap();
             assert!(!st.enabled, "{s}");
@@ -129,11 +137,7 @@ mod tests {
 
     #[test]
     fn parse_enabled_with_plus_e164() {
-        let st = parse_ussd_reply(
-            "Call Forwarding Unconditional +989121234567",
-            "IR",
-        )
-        .unwrap();
+        let st = parse_ussd_reply("Call Forwarding Unconditional +989121234567", "IR").unwrap();
         assert!(st.enabled);
         assert_eq!(st.e164.as_deref(), Some("+989121234567"));
     }
@@ -148,5 +152,10 @@ mod tests {
     #[test]
     fn parse_garbage_errors() {
         assert!(parse_ussd_reply("asdf qwerty", "IR").is_err());
+    }
+
+    #[test]
+    fn unrelated_digit_run_does_not_enable_forwarding() {
+        assert!(parse_ussd_reply("Account reference 09121234567", "IR").is_err());
     }
 }

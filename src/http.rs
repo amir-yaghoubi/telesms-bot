@@ -14,9 +14,7 @@ use serde_json::{json, Value};
 use subtle::ConstantTimeEq;
 use tokio_util::sync::CancellationToken;
 
-use crate::actions::{
-    self, ActionError, Identity, NumberState, Opened, SmsSent, Who,
-};
+use crate::actions::{self, ActionError, Identity, NumberState, Opened, SmsSent, Who};
 use crate::app::TelegramSink;
 use crate::config::Config;
 use crate::db::Db;
@@ -45,7 +43,10 @@ pub fn router(state: HttpState) -> Router {
         .route("/call-forward", get(call_forward_get).put(call_forward_put))
         .route("/chats", get(chats_handler))
         .route("/chats/{thread_id}/messages", get(chat_messages_handler))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .method_not_allowed_fallback(api_method_not_allowed)
         .fallback(api_not_found);
 
@@ -56,14 +57,8 @@ pub fn router(state: HttpState) -> Router {
         .with_state(state)
 }
 
-pub async fn serve(
-    state: HttpState,
-    bind: std::net::SocketAddr,
-    cancel: CancellationToken,
-) {
-    let listener = tokio::net::TcpListener::bind(bind)
-        .await
-        .expect("api bind");
+pub async fn serve(state: HttpState, bind: std::net::SocketAddr, cancel: CancellationToken) {
+    let listener = tokio::net::TcpListener::bind(bind).await.expect("api bind");
     axum::serve(listener, router(state))
         .with_graceful_shutdown(async move {
             cancel.cancelled().await;
@@ -212,11 +207,7 @@ fn api_key_matches(expected: &str, provided: &str) -> bool {
     contents_equal && expected.len() == provided.len()
 }
 
-async fn auth_middleware(
-    State(state): State<HttpState>,
-    request: Request,
-    next: Next,
-) -> Response {
+async fn auth_middleware(State(state): State<HttpState>, request: Request, next: Next) -> Response {
     let Some(expected) = state.cfg.api_key.as_ref().filter(|k| !k.is_empty()) else {
         return unauthorized();
     };
@@ -322,8 +313,6 @@ async fn not_found() -> impl IntoResponse {
 async fn status_handler(State(state): State<HttpState>) -> Response {
     match actions::status(
         state.info.as_ref(),
-        state.forward.as_ref(),
-        &state.cfg.default_region,
         state.db.as_ref(),
         state.cfg.status_tz,
         &state.cfg.modem_uid,
@@ -870,9 +859,7 @@ mod tests {
                 .uri("/api/v1/sms")
                 .header("X-Api-Key", "k")
                 .header("content-type", "application/json")
-                .body(Body::from(
-                    r#"{"number":"09121234567","text":"hi"}"#,
-                ))
+                .body(Body::from(r#"{"number":"09121234567","text":"hi"}"#))
                 .unwrap(),
         )
         .await;

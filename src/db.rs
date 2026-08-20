@@ -5,6 +5,8 @@ use std::sync::Mutex;
 use rusqlite::{Connection, OptionalExtension};
 use thiserror::Error;
 
+const PENDING_FORWARD_TTL_MINUTES: i64 = 10;
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS contacts (
   id INTEGER PRIMARY KEY,
@@ -150,8 +152,14 @@ impl Db {
                 thread_id INTEGER PRIMARY KEY,
                 mode TEXT NOT NULL,
                 edit_chat_id INTEGER NOT NULL,
-                edit_message_id INTEGER NOT NULL
+                edit_message_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL
              );",
+        )?;
+        let _ = conn.execute("ALTER TABLE pending_forward ADD COLUMN created_at TEXT", []);
+        conn.execute(
+            "UPDATE pending_forward SET created_at = ?1 WHERE created_at IS NULL",
+            [Self::now()],
         )?;
         let db = Db {
             conn: Mutex::new(conn),
@@ -406,17 +414,20 @@ impl Db {
     ) -> Result<(), DbError> {
         let conn = self.conn()?;
         conn.execute(
-            "INSERT INTO pending_forward (thread_id, mode, edit_chat_id, edit_message_id)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO pending_forward
+               (thread_id, mode, edit_chat_id, edit_message_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(thread_id) DO UPDATE SET
                mode = excluded.mode,
                edit_chat_id = excluded.edit_chat_id,
-               edit_message_id = excluded.edit_message_id",
+               edit_message_id = excluded.edit_message_id,
+               created_at = excluded.created_at",
             rusqlite::params![
                 thread_id,
                 Self::pending_forward_mode_str(mode),
                 edit_chat_id,
                 edit_message_id,
+                Self::now(),
             ],
         )?;
         Ok(())
@@ -424,10 +435,13 @@ impl Db {
 
     pub fn get_pending_forward(&self, thread_id: i32) -> Result<Option<PendingForward>, DbError> {
         let conn = self.conn()?;
+        let cutoff = (chrono::Utc::now() - chrono::Duration::minutes(PENDING_FORWARD_TTL_MINUTES))
+            .to_rfc3339();
         conn.query_row(
             "SELECT mode, edit_chat_id, edit_message_id
-             FROM pending_forward WHERE thread_id = ?1",
-            rusqlite::params![thread_id],
+             FROM pending_forward
+             WHERE thread_id = ?1 AND unixepoch(created_at) >= unixepoch(?2)",
+            rusqlite::params![thread_id, cutoff],
             Self::pending_forward_from_row,
         )
         .optional()
@@ -435,10 +449,22 @@ impl Db {
     }
 
     pub fn take_pending_forward(&self, thread_id: i32) -> Result<Option<PendingForward>, DbError> {
-        let pending = self.get_pending_forward(thread_id)?;
-        if pending.is_some() {
-            self.clear_pending_forward(thread_id)?;
-        }
+        let conn = self.conn()?;
+        let cutoff = (chrono::Utc::now() - chrono::Duration::minutes(PENDING_FORWARD_TTL_MINUTES))
+            .to_rfc3339();
+        let pending = conn
+            .query_row(
+                "SELECT mode, edit_chat_id, edit_message_id
+                 FROM pending_forward
+                 WHERE thread_id = ?1 AND unixepoch(created_at) >= unixepoch(?2)",
+                rusqlite::params![thread_id, cutoff],
+                Self::pending_forward_from_row,
+            )
+            .optional()?;
+        conn.execute(
+            "DELETE FROM pending_forward WHERE thread_id = ?1",
+            rusqlite::params![thread_id],
+        )?;
         Ok(pending)
     }
 
@@ -924,8 +950,15 @@ mod tests {
     #[test]
     fn seen_sms_same_content_different_path() {
         let db = Db::open_in_memory().unwrap();
-        db.record_inbound("/sms/1", "+98912", "hi", None, "2026-08-19T12:00:00+00:00", 1)
-            .unwrap();
+        db.record_inbound(
+            "/sms/1",
+            "+98912",
+            "hi",
+            None,
+            "2026-08-19T12:00:00+00:00",
+            1,
+        )
+        .unwrap();
         assert!(db
             .seen_sms("/sms/2", "+98912", "hi", "2026-08-19T12:00:00+00:00")
             .unwrap());
@@ -1069,7 +1102,9 @@ mod tests {
         db.record_outbound("+98912", "bye", "ok", 7).unwrap();
         let conn = db.conn().unwrap();
         let tid: i32 = conn
-            .query_row("SELECT thread_id FROM outbound_log LIMIT 1", [], |r| r.get(0))
+            .query_row("SELECT thread_id FROM outbound_log LIMIT 1", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(tid, 7);
     }
@@ -1118,7 +1153,9 @@ mod tests {
             .unwrap();
         assert_eq!(in_tid, Some(42));
         let out_tid: Option<i32> = conn
-            .query_row("SELECT thread_id FROM outbound_log LIMIT 1", [], |r| r.get(0))
+            .query_row("SELECT thread_id FROM outbound_log LIMIT 1", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(out_tid, None); // unknown number stays NULL → COALESCE to General at query time
     }
@@ -1196,6 +1233,24 @@ mod tests {
         let taken = db.take_pending_forward(1).unwrap().unwrap();
         assert!(db.get_pending_forward(1).unwrap().is_none());
         assert_eq!(taken.edit_chat_id, 99);
+    }
+
+    #[test]
+    fn expired_pending_forward_is_cleared_and_ignored() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_pending_forward(1, PendingForwardMode::Number, 99, 7)
+            .unwrap();
+        db.conn()
+            .unwrap()
+            .execute(
+                "UPDATE pending_forward SET created_at = '2020-01-01T00:00:00Z'
+                 WHERE thread_id = 1",
+                [],
+            )
+            .unwrap();
+
+        assert!(db.take_pending_forward(1).unwrap().is_none());
+        assert!(db.get_pending_forward(1).unwrap().is_none());
     }
 
     #[test]

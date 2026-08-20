@@ -123,6 +123,23 @@ async fn pending_forward_number_consumes_text_and_clears_pending() {
     assert!(db.get_pending_forward(9).unwrap().is_none());
 }
 
+#[tokio::test]
+async fn pending_forward_does_not_consume_commands() {
+    use crate::db::PendingForwardMode;
+
+    let db = Db::open_in_memory().unwrap();
+    db.set_pending_forward(9, PendingForwardMode::Number, -100, 77)
+        .unwrap();
+    let modem = FakeModem::default();
+
+    let result = handle_pending_forward_text(&db, "IR", 9, "/sms 0912 hello", &modem)
+        .await
+        .unwrap();
+
+    assert!(result.is_none());
+    assert!(db.get_pending_forward(9).unwrap().is_none());
+}
+
 #[test]
 fn format_who_marks_default() {
     let t = Topic {

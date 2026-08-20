@@ -119,20 +119,14 @@ pub fn status_json_from_snapshot(snap: &StatusSnapshot) -> StatusJson<'_> {
         today_out_ok: snap.today_out_ok,
         today_out_fail: snap.today_out_fail,
         last_fail_error: snap.last_fail_error.as_deref(),
-        last_in: snap
-            .last_in
-            .as_ref()
-            .map(|s| LastSmsJson {
-                label: &s.label,
-                when: &s.when,
-            }),
-        last_out: snap
-            .last_out
-            .as_ref()
-            .map(|s| LastSmsJson {
-                label: &s.label,
-                when: &s.when,
-            }),
+        last_in: snap.last_in.as_ref().map(|s| LastSmsJson {
+            label: &s.label,
+            when: &s.when,
+        }),
+        last_out: snap.last_out.as_ref().map(|s| LastSmsJson {
+            label: &s.label,
+            when: &s.when,
+        }),
         contacts_ok: snap.contacts_ok,
     }
 }
@@ -298,7 +292,7 @@ pub fn today_start_rfc3339(now: chrono::DateTime<chrono::Utc>, tz: chrono_tz::Tz
 
 pub async fn gather(
     modem: &dyn ModemInfo,
-    forward: &dyn crate::modem::CallForward,
+    forward: Option<&dyn crate::modem::CallForward>,
     region: &str,
     db: &Db,
     tz: chrono_tz::Tz,
@@ -321,20 +315,23 @@ pub async fn gather(
     } else {
         None
     };
-    let forward_view = match forward.query_forward(region).await {
-        Ok(st) if !st.enabled => ForwardView::Off,
-        Ok(st) => {
-            let e164 = st.e164.unwrap_or_default();
-            let label = db
-                .find_contact_by_e164(&e164)?
-                .map(|c| c.display_name)
-                .unwrap_or(e164);
-            ForwardView::On { label }
-        }
-        Err(err) => {
-            tracing::warn!(error = %err, "status call forward query");
-            ForwardView::Unavailable
-        }
+    let forward_view = match forward {
+        None => ForwardView::Unavailable,
+        Some(forward) => match forward.query_forward(region).await {
+            Ok(st) if !st.enabled => ForwardView::Off,
+            Ok(st) => {
+                let e164 = st.e164.unwrap_or_default();
+                let label = db
+                    .find_contact_by_e164(&e164)?
+                    .map(|c| c.display_name)
+                    .unwrap_or(e164);
+                ForwardView::On { label }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "status call forward query");
+                ForwardView::Unavailable
+            }
+        },
     };
     Ok(StatusSnapshot {
         modem_uid: modem_uid.to_string(),
@@ -634,7 +631,7 @@ Contacts · OK"
             "2026-08-19T10:00:00+00:00",
             None,
         )
-            .unwrap();
+        .unwrap();
         let id = db.upsert_contact("people/a", "Ali").unwrap();
         db.replace_contact_numbers(id, &["+989111111111".into()])
             .unwrap();
@@ -642,15 +639,15 @@ Contacts · OK"
         let now = Utc.with_ymd_and_hms(2026, 8, 19, 11, 0, 0).unwrap();
         let snap = gather(
             &modem,
-            &modem,
+            Some(&modem),
             "IR",
             &db,
             chrono_tz::Asia::Tehran,
             "dwm222",
             now,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         assert!(matches!(snap.modem, ModemView::Offline));
         assert_eq!(snap.today_in, 1);
         assert_eq!(snap.last_in.as_ref().unwrap().label, "Ali");
@@ -664,19 +661,25 @@ Contacts · OK"
         let now = Utc.with_ymd_and_hms(2026, 8, 19, 11, 0, 0).unwrap();
         let snap = gather(
             &modem,
-            &modem,
+            Some(&modem),
             "IR",
             &db,
             chrono_tz::UTC,
             "dwm222",
             now,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         match snap.modem {
             ModemView::Live(live) => assert_eq!(live.state, ModemState::Registered),
             ModemView::Offline => panic!("expected live"),
         }
+        assert_eq!(
+            modem
+                .forward_queries
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
         assert!(snap.contacts_ok);
     }
 
@@ -692,7 +695,7 @@ Contacts · OK"
         let now = Utc.with_ymd_and_hms(2026, 8, 19, 11, 0, 0).unwrap();
         let snap = gather(
             &modem,
-            &forward,
+            Some(&forward),
             "IR",
             &db,
             chrono_tz::UTC,
@@ -702,5 +705,24 @@ Contacts · OK"
         .await
         .unwrap();
         assert!(matches!(snap.forward, ForwardView::Unavailable));
+    }
+
+    #[tokio::test]
+    async fn gather_without_forward_skips_forward_query() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let modem = crate::modem::FakeModem::default();
+        let now = Utc.with_ymd_and_hms(2026, 8, 19, 11, 0, 0).unwrap();
+
+        let snap = gather(&modem, None, "IR", &db, chrono_tz::UTC, "dwm222", now)
+            .await
+            .unwrap();
+
+        assert!(matches!(snap.forward, ForwardView::Unavailable));
+        assert_eq!(
+            modem
+                .forward_queries
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
     }
 }

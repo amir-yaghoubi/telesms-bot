@@ -170,7 +170,11 @@ pub trait ModemInfo: Send + Sync {
 #[async_trait::async_trait]
 pub trait CallForward: Send + Sync {
     async fn query_forward(&self, default_region: &str) -> Result<CallForwardState, ModemError>;
-    async fn set_forward(&self, e164: &str, default_region: &str) -> Result<CallForwardState, ModemError>;
+    async fn set_forward(
+        &self,
+        e164: &str,
+        default_region: &str,
+    ) -> Result<CallForwardState, ModemError>;
     async fn disable_forward(&self, default_region: &str) -> Result<CallForwardState, ModemError>;
 }
 
@@ -184,6 +188,7 @@ pub struct FakeModem {
     pub listed: Mutex<Vec<IncomingSms>>,
     pub forward: Mutex<CallForwardState>,
     pub forward_fail: bool,
+    pub forward_queries: AtomicU64,
 }
 
 impl Default for FakeModem {
@@ -201,6 +206,7 @@ impl Default for FakeModem {
                 e164: None,
             }),
             forward_fail: false,
+            forward_queries: AtomicU64::new(0),
         }
     }
 }
@@ -258,13 +264,18 @@ impl ModemInfo for FakeModem {
 #[async_trait::async_trait]
 impl CallForward for FakeModem {
     async fn query_forward(&self, _default_region: &str) -> Result<CallForwardState, ModemError> {
+        self.forward_queries.fetch_add(1, Ordering::SeqCst);
         if self.forward_fail {
             return Err(ModemError::Failed("forward fail".into()));
         }
         Ok(self.forward.lock().expect("forward lock").clone())
     }
 
-    async fn set_forward(&self, e164: &str, default_region: &str) -> Result<CallForwardState, ModemError> {
+    async fn set_forward(
+        &self,
+        e164: &str,
+        default_region: &str,
+    ) -> Result<CallForwardState, ModemError> {
         if self.forward_fail {
             return Err(ModemError::Failed("forward fail".into()));
         }

@@ -142,10 +142,22 @@ pub fn resolve(
         }
     }
 
-    if contact_ids.iter().copied().collect::<std::collections::HashSet<_>>().len() > 1 {
+    if contact_ids
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        > 1
+    {
         return Err(ActionError::IdentityConflict);
     }
-    if topic_ids.iter().copied().collect::<std::collections::HashSet<_>>().len() > 1 {
+    if topic_ids
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        > 1
+    {
         return Err(ActionError::IdentityConflict);
     }
     if let (Some(provided), Some(ref t)) = (id.thread_id, topic.as_ref()) {
@@ -518,12 +530,9 @@ pub async fn ignore(
     for n in &targets {
         db.ignore_number(n)?;
     }
-    tg.post(
-        topic.thread_id,
-        format!("ignored {}", targets.join(", ")),
-    )
-    .await
-    .map_err(ActionError::from)?;
+    tg.post(topic.thread_id, format!("ignored {}", targets.join(", ")))
+        .await
+        .map_err(ActionError::from)?;
     Ok(targets)
 }
 
@@ -737,10 +746,7 @@ pub async fn get_call_forward(
     forward: &dyn crate::modem::CallForward,
     region: &str,
 ) -> Result<crate::call_forward::CallForwardState, ActionError> {
-    forward
-        .query_forward(region)
-        .await
-        .map_err(map_forward_err)
+    forward.query_forward(region).await.map_err(map_forward_err)
 }
 
 pub async fn put_call_forward(
@@ -773,24 +779,16 @@ fn map_forward_err(err: crate::modem::ModemError) -> ActionError {
 
 pub async fn status(
     modem: &dyn crate::modem::ModemInfo,
-    forward: &dyn crate::modem::CallForward,
-    region: &str,
     db: &Db,
     tz: chrono_tz::Tz,
     modem_uid: &str,
 ) -> Result<serde_json::Value, ActionError> {
-    let snap = crate::status::gather(
-        modem,
-        forward,
-        region,
-        db,
-        tz,
-        modem_uid,
-        chrono::Utc::now(),
+    let snap =
+        crate::status::gather(modem, None, "", db, tz, modem_uid, chrono::Utc::now()).await?;
+    Ok(
+        serde_json::to_value(crate::status::status_json_from_snapshot(&snap))
+            .expect("StatusJson serializes"),
     )
-    .await?;
-    Ok(serde_json::to_value(crate::status::status_json_from_snapshot(&snap))
-        .expect("StatusJson serializes"))
 }
 
 #[cfg(test)]
@@ -845,9 +843,7 @@ mod tests {
     #[test]
     fn list_chats_offset_cursor_matches_utc_equivalent() {
         let db = Db::open_in_memory().unwrap();
-        for (thread_id, e164, title) in
-            [(41, "+98912", "Before"), (42, "+98913", "After")]
-        {
+        for (thread_id, e164, title) in [(41, "+98912", "Before"), (42, "+98913", "After")] {
             db.upsert_topic(&Topic {
                 thread_id,
                 contact_id: None,
@@ -875,8 +871,7 @@ mod tests {
         .unwrap();
 
         let utc = list_chats(&db, None, Some("2026-08-20T09:00:00Z"), None).unwrap();
-        let offset =
-            list_chats(&db, None, Some("2026-08-20T12:30:00+03:30"), None).unwrap();
+        let offset = list_chats(&db, None, Some("2026-08-20T12:30:00+03:30"), None).unwrap();
 
         assert_eq!(offset.chats.len(), utc.chats.len());
         assert_eq!(
@@ -1462,13 +1457,17 @@ mod tests {
     async fn status_offline_json() {
         let db = Db::open_in_memory().unwrap();
         let modem = crate::modem::FakeModem::default();
-        let v = status(&modem, &modem, "IR", &db, chrono_tz::UTC, "dwm222")
-            .await
-            .unwrap();
+        let v = status(&modem, &db, chrono_tz::UTC, "dwm222").await.unwrap();
         assert_eq!(v["modem"]["state"], "offline");
         assert_eq!(v["modem_uid"], "dwm222");
         assert_eq!(v["contacts_ok"], true);
         assert!(v.get("forward").is_none());
+        assert_eq!(
+            modem
+                .forward_queries
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
     }
 
     #[tokio::test]

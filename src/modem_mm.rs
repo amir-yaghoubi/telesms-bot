@@ -35,6 +35,10 @@ fn mm_err(err: impl std::fmt::Display) -> ModemError {
     ModemError::Failed(err.to_string())
 }
 
+fn apply_ussd_reply(reply: Result<String, ModemError>) -> Result<(), ModemError> {
+    reply.map(|_| ())
+}
+
 pub fn delete_already_gone_name(name: &str) -> bool {
     name == "org.freedesktop.DBus.Error.UnknownObject"
         || name == "org.freedesktop.ModemManager1.Error.Core.NotFound"
@@ -384,15 +388,10 @@ impl MmModem {
         ))
     }
 
-    async fn ussd_roundtrip(
-        &self,
-        command: &str,
-        default_region: &str,
-    ) -> Result<CallForwardState, ModemError> {
+    async fn ussd_initiate(&self, command: &str) -> Result<String, ModemError> {
         self.with_modem_path(|modem_path| {
             let conn = self.conn.clone();
             let command = command.to_string();
-            let default_region = default_region.to_string();
             async move {
                 let ussd = UssdProxy::builder(&conn)
                     .path(&modem_path)
@@ -408,10 +407,19 @@ impl MmModem {
                 let reply = result
                     .map_err(|_| ModemError::Failed("ussd timeout".into()))?
                     .map_err(mm_err)?;
-                parse_ussd_reply(&reply, &default_region).map_err(ModemError::Failed)
+                Ok(reply)
             }
         })
         .await
+    }
+
+    async fn ussd_roundtrip(
+        &self,
+        command: &str,
+        default_region: &str,
+    ) -> Result<CallForwardState, ModemError> {
+        let reply = self.ussd_initiate(command).await?;
+        parse_ussd_reply(&reply, default_region).map_err(ModemError::Failed)
     }
 }
 
@@ -623,8 +631,7 @@ impl CallForward for MmModem {
         let _guard = self.call_forward_lock.lock().await;
         let e164 = normalize_e164(e164, default_region)
             .map_err(|err| ModemError::Failed(err.to_string()))?;
-        self.ussd_roundtrip(&ussd_enable(&e164), default_region)
-            .await?;
+        apply_ussd_reply(self.ussd_initiate(&ussd_enable(&e164)).await)?;
 
         match self.ussd_roundtrip(ussd_query(), default_region).await {
             Ok(state) => Ok(state),
@@ -637,7 +644,7 @@ impl CallForward for MmModem {
 
     async fn disable_forward(&self, default_region: &str) -> Result<CallForwardState, ModemError> {
         let _guard = self.call_forward_lock.lock().await;
-        self.ussd_roundtrip(ussd_disable(), default_region).await?;
+        apply_ussd_reply(self.ussd_initiate(ussd_disable()).await)?;
 
         match self.ussd_roundtrip(ussd_query(), default_region).await {
             Ok(state) => Ok(state),
@@ -678,6 +685,13 @@ mod tests {
         assert!(!sms_text_ready(""));
         assert!(sms_text_ready("hi"));
         assert!(sms_text_ready("سلام\nline"));
+    }
+
+    #[test]
+    fn apply_ussd_reply_only_requires_initiate_success() {
+        assert!(parse_ussd_reply("Operation completed", "IR").is_err());
+        assert!(apply_ussd_reply(Ok("Operation completed".into())).is_ok());
+        assert!(apply_ussd_reply(Err(ModemError::Failed("initiate failed".into()))).is_err());
     }
 
     #[test]

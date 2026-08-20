@@ -167,7 +167,7 @@ On the machine that owns the stick, you can skip native run and use
 | `/who` | Contact topic | Name, numbers, current default |
 | `/number` | Contact topic | Buttons to set the default number |
 | `/ignore` | Contact / General | Stop auto-creating a topic for a number |
-| `/forward` | Any topic or a DM with the bot | Interactive: set or disable unconditional call forwarding |
+| `/forward` | Any forum topic | Interactive: set or disable unconditional call forwarding |
 | `/status` | Any topic or a DM with the bot | Modem, SIM, call forward line, today’s counts, last in/out |
 
 Typing in a contact topic sends SMS to that contact’s default number.
