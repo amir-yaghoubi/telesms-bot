@@ -596,9 +596,13 @@ async fn on_inline_query(bot: Bot, q: InlineQuery, db: Arc<Db>) -> Result<(), Ap
     let articles = if query.is_empty() {
         inline_answer_articles(query, Ok(&[]))
     } else {
-        match db.search_contacts(query) {
+        match search_contacts(&db, query) {
             Ok(hits) => inline_answer_articles(query, Ok(&hits)),
-            Err(_) => inline_answer_articles(query, Err(())),
+            Err(ActionError::ContactsUnavailable | ActionError::Validation(_)) => {
+                inline_answer_articles(query, Err(()))
+            }
+            Err(ActionError::Db(e)) => return Err(e.into()),
+            Err(e) => return Err(AppError::Telegram(e.to_string())),
         }
     };
     bot.answer_inline_query(q.id, inline_query_results(&articles))

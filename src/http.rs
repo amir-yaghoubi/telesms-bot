@@ -1,12 +1,14 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{Request, State};
+use axum::extract::{FromRequest, Request, State};
+use axum::extract::rejection::JsonRejection;
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use subtle::ConstantTimeEq;
@@ -39,7 +41,9 @@ pub fn router(state: HttpState) -> Router {
         .route("/who", post(who_handler))
         .route("/number", post(number_handler))
         .route("/ignore", post(ignore_handler))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .method_not_allowed_fallback(api_method_not_allowed)
+        .fallback(api_not_found);
 
     Router::new()
         .route("/health", get(health))
@@ -178,6 +182,18 @@ fn identity_from_req(req: IdentityReq) -> Result<Identity, ActionError> {
     })
 }
 
+fn api_key_matches(expected: &str, provided: &str) -> bool {
+    let max_len = expected.len().max(provided.len());
+    let mut expected_buf = vec![0u8; max_len];
+    let mut provided_buf = vec![0u8; max_len];
+    if max_len > 0 {
+        expected_buf[..expected.len()].copy_from_slice(expected.as_bytes());
+        provided_buf[..provided.len()].copy_from_slice(provided.as_bytes());
+    }
+    let contents_equal = bool::from(expected_buf.as_slice().ct_eq(provided_buf.as_slice()));
+    contents_equal && expected.len() == provided.len()
+}
+
 async fn auth_middleware(
     State(state): State<HttpState>,
     request: Request,
@@ -193,14 +209,71 @@ async fn auth_middleware(
     else {
         return unauthorized();
     };
-    if expected.len() != header.len() {
-        let _ = b"xxxxxxxx".as_slice().ct_eq(b"yyyyyyyy");
-        return unauthorized();
-    }
-    if !bool::from(expected.as_bytes().ct_eq(header.as_bytes())) {
+    if !api_key_matches(expected, header) {
         return unauthorized();
     }
     next.run(request).await
+}
+
+fn api_error_response(status: StatusCode, error: &str, message: &str) -> Response {
+    (
+        status,
+        Json(json!({
+            "error": error,
+            "message": message,
+        })),
+    )
+        .into_response()
+}
+
+fn json_rejection_response(rejection: JsonRejection) -> Response {
+    let message = match rejection {
+        JsonRejection::JsonDataError(err) => err.to_string(),
+        JsonRejection::JsonSyntaxError(err) => err.to_string(),
+        JsonRejection::MissingJsonContentType(_) => {
+            "expected request with content-type application/json".into()
+        }
+        JsonRejection::BytesRejection(err) => err.to_string(),
+        _ => "invalid request body".into(),
+    };
+    api_error_response(StatusCode::BAD_REQUEST, "validation", &message)
+}
+
+struct ApiJson<T>(T);
+
+impl<T> std::ops::Deref for ApiJson<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T, S> FromRequest<S> for ApiJson<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(ApiJson(value)),
+            Err(rejection) => Err(json_rejection_response(rejection)),
+        }
+    }
+}
+
+async fn api_method_not_allowed() -> Response {
+    api_error_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "validation",
+        "method not allowed",
+    )
+}
+
+async fn api_not_found() -> Response {
+    api_error_response(StatusCode::NOT_FOUND, "not_found", "not found")
 }
 
 fn unauthorized() -> Response {
@@ -249,7 +322,7 @@ struct SearchReq {
 
 async fn search_handler(
     State(state): State<HttpState>,
-    Json(body): Json<SearchReq>,
+    ApiJson(body): ApiJson<SearchReq>,
 ) -> Response {
     match actions::search_contacts(state.db.as_ref(), &body.query) {
         Ok(contacts) => {
@@ -281,7 +354,7 @@ struct SmsReq {
     text: String,
 }
 
-async fn sms_handler(State(state): State<HttpState>, Json(body): Json<SmsReq>) -> Response {
+async fn sms_handler(State(state): State<HttpState>, ApiJson(body): ApiJson<SmsReq>) -> Response {
     let id = match identity_from_req(IdentityReq {
         number: body.number,
         contact_id: body.contact_id,
@@ -309,7 +382,10 @@ async fn sms_handler(State(state): State<HttpState>, Json(body): Json<SmsReq>) -
     }
 }
 
-async fn open_handler(State(state): State<HttpState>, Json(body): Json<IdentityReq>) -> Response {
+async fn open_handler(
+    State(state): State<HttpState>,
+    ApiJson(body): ApiJson<IdentityReq>,
+) -> Response {
     let id = match identity_from_req(body) {
         Ok(id) => id,
         Err(e) => return action_to_response(e).into_response(),
@@ -327,7 +403,10 @@ async fn open_handler(State(state): State<HttpState>, Json(body): Json<IdentityR
     }
 }
 
-async fn who_handler(State(state): State<HttpState>, Json(body): Json<IdentityReq>) -> Response {
+async fn who_handler(
+    State(state): State<HttpState>,
+    ApiJson(body): ApiJson<IdentityReq>,
+) -> Response {
     let id = match identity_from_req(body) {
         Ok(id) => id,
         Err(e) => return action_to_response(e).into_response(),
@@ -351,7 +430,7 @@ struct NumberReq {
 
 async fn number_handler(
     State(state): State<HttpState>,
-    Json(body): Json<NumberReq>,
+    ApiJson(body): ApiJson<NumberReq>,
 ) -> Response {
     let id = match identity_from_req(IdentityReq {
         number: body.number,
@@ -382,7 +461,7 @@ async fn number_handler(
 
 async fn ignore_handler(
     State(state): State<HttpState>,
-    Json(body): Json<IdentityReq>,
+    ApiJson(body): ApiJson<IdentityReq>,
 ) -> Response {
     let id = match identity_from_req(body) {
         Ok(id) => id,
@@ -443,12 +522,18 @@ mod tests {
     use crate::app::FakeTg;
     use crate::db::Topic;
     use crate::modem::FakeModem;
+    use http_body_util::BodyExt;
     use std::path::PathBuf;
     use std::time::Duration;
     use tower::ServiceExt;
 
     async fn call(app: Router, req: axum::http::Request<Body>) -> axum::http::Response<Body> {
         app.oneshot(req).await.unwrap()
+    }
+
+    async fn body_json(res: axum::http::Response<Body>) -> Value {
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
     }
 
     fn test_config(api_key: &str) -> Config {
@@ -561,6 +646,87 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn api_key_length_mismatch_rejected() {
+        assert!(!api_key_matches("secret", "sec"));
+        assert!(!api_key_matches("secret", "secretx"));
+        assert!(api_key_matches("secret", "secret"));
+    }
+
+    #[tokio::test]
+    async fn invalid_json_returns_envelope() {
+        let app = test_router("k");
+        let res = call(
+            app,
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/who")
+                .header("X-Api-Key", "k")
+                .header("content-type", "application/json")
+                .body(Body::from("{not json"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(res).await;
+        assert_eq!(body["error"], "validation");
+        assert!(body["message"].is_string());
+    }
+
+    #[tokio::test]
+    async fn wrong_method_returns_envelope() {
+        let app = test_router("k");
+        let res = call(
+            app,
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/status")
+                .header("X-Api-Key", "k")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let body = body_json(res).await;
+        assert_eq!(body["error"], "validation");
+        assert_eq!(body["message"], "method not allowed");
+    }
+
+    #[tokio::test]
+    async fn unknown_api_route_returns_envelope() {
+        let app = test_router("k");
+        let res = call(
+            app,
+            axum::http::Request::builder()
+                .uri("/api/v1/missing")
+                .header("X-Api-Key", "k")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let body = body_json(res).await;
+        assert_eq!(body["error"], "not_found");
+        assert_eq!(body["message"], "not found");
+    }
+
+    #[tokio::test]
+    async fn wrong_key_length_unauthorized() {
+        let app = test_router("secret");
+        let res = call(
+            app,
+            axum::http::Request::builder()
+                .uri("/api/v1/status")
+                .header("X-Api-Key", "sec")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let body = body_json(res).await;
+        assert_eq!(body["error"], "unauthorized");
     }
 
     #[tokio::test]
