@@ -33,6 +33,9 @@ fn sample_cfg() -> Config {
         status_tz: chrono_tz::Asia::Tehran,
         sms_delete_enabled: true,
         sms_delete_max_age: Duration::from_secs(30 * 86400),
+        api_key: None,
+        api_bind: "0.0.0.0".into(),
+        api_port: 8787,
     }
 }
 

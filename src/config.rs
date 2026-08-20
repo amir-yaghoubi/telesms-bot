@@ -19,6 +19,9 @@ pub struct Config {
     pub status_tz: chrono_tz::Tz,
     pub sms_delete_enabled: bool,
     pub sms_delete_max_age: Duration,
+    pub api_key: Option<String>,
+    pub api_bind: String,
+    pub api_port: u16,
 }
 
 #[derive(Debug, Error)]
@@ -77,7 +80,29 @@ impl Config {
                     })?,
                 } * 86400,
             ),
+            api_key: {
+                match env::var("API_KEY") {
+                    Err(_) => None,
+                    Ok(s) if s.trim().is_empty() => None,
+                    Ok(s) => Some(s),
+                }
+            },
+            api_bind: env::var("API_BIND").unwrap_or_else(|_| "0.0.0.0".to_string()),
+            api_port: match env::var("API_PORT") {
+                Err(_) => 8787,
+                Ok(v) if v.trim().is_empty() => 8787,
+                Ok(v) => v.parse::<u16>().map_err(|e| ConfigError::Invalid {
+                    key: "API_PORT",
+                    source: Box::new(e),
+                })?,
+            },
         })
+    }
+
+    pub fn api_enabled(&self) -> bool {
+        self.api_key
+            .as_ref()
+            .is_some_and(|k| !k.trim().is_empty())
     }
 }
 
@@ -148,6 +173,9 @@ mod tests {
         std::env::remove_var("SMS_DELETE_ENABLED");
         std::env::remove_var("SMS_DELETE_MAX_AGE_DAYS");
         std::env::remove_var("STATUS_TZ");
+        std::env::remove_var("API_KEY");
+        std::env::remove_var("API_BIND");
+        std::env::remove_var("API_PORT");
     }
 
     #[test]
@@ -265,5 +293,57 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn api_disabled_when_key_unset() {
+        let _g = ENV_LOCK.lock().unwrap();
+        set_required_env();
+        std::env::remove_var("API_KEY");
+        std::env::remove_var("API_BIND");
+        std::env::remove_var("API_PORT");
+        let c = Config::from_env().unwrap();
+        assert!(!c.api_enabled());
+        assert_eq!(c.api_bind, "0.0.0.0");
+        assert_eq!(c.api_port, 8787);
+    }
+
+    #[test]
+    fn api_enabled_when_key_set() {
+        let _g = ENV_LOCK.lock().unwrap();
+        set_required_env();
+        std::env::set_var("API_KEY", "secret");
+        std::env::set_var("API_BIND", "127.0.0.1");
+        std::env::set_var("API_PORT", "9000");
+        let c = Config::from_env().unwrap();
+        assert!(c.api_enabled());
+        assert_eq!(c.api_key.as_deref(), Some("secret"));
+        assert_eq!(c.api_bind, "127.0.0.1");
+        assert_eq!(c.api_port, 9000);
+        std::env::remove_var("API_KEY");
+        std::env::remove_var("API_BIND");
+        std::env::remove_var("API_PORT");
+    }
+
+    #[test]
+    fn api_empty_key_is_disabled() {
+        let _g = ENV_LOCK.lock().unwrap();
+        set_required_env();
+        std::env::set_var("API_KEY", "  ");
+        let c = Config::from_env().unwrap();
+        assert!(!c.api_enabled());
+        std::env::remove_var("API_KEY");
+    }
+
+    #[test]
+    fn api_port_rejects_garbage() {
+        let _g = ENV_LOCK.lock().unwrap();
+        set_required_env();
+        std::env::set_var("API_PORT", "nope");
+        match Config::from_env() {
+            Err(ConfigError::Invalid { key, .. }) => assert_eq!(key, "API_PORT"),
+            other => panic!("{other:?}"),
+        }
+        std::env::remove_var("API_PORT");
     }
 }
