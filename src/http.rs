@@ -129,6 +129,20 @@ pub fn action_to_response(err: ActionError) -> (StatusCode, Json<Value>) {
                 "message": msg,
             })),
         ),
+        ActionError::ModemUnavailable(msg) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "modem_unavailable",
+                "message": msg,
+            })),
+        ),
+        ActionError::ForwardFailed(msg) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": "forward_failed",
+                "message": msg,
+            })),
+        ),
         ActionError::TelegramFailed { sent, message } => (
             StatusCode::BAD_GATEWAY,
             Json(json!({

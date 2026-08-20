@@ -45,6 +45,10 @@ pub enum ActionError {
     ContactsUnavailable,
     #[error("{0}")]
     ModemFailed(String),
+    #[error("{0}")]
+    ModemUnavailable(String),
+    #[error("{0}")]
+    ForwardFailed(String),
     #[error("{message}")]
     TelegramFailed { sent: bool, message: String },
     #[error(transparent)]
@@ -727,6 +731,44 @@ pub async fn send_sms(
         thread_id,
         sent: true,
     })
+}
+
+pub async fn get_call_forward(
+    forward: &dyn crate::modem::CallForward,
+    region: &str,
+) -> Result<crate::call_forward::CallForwardState, ActionError> {
+    forward
+        .query_forward(region)
+        .await
+        .map_err(map_forward_err)
+}
+
+pub async fn put_call_forward(
+    forward: &dyn crate::modem::CallForward,
+    region: &str,
+    e164: Option<String>,
+) -> Result<crate::call_forward::CallForwardState, ActionError> {
+    match e164 {
+        None => forward
+            .disable_forward(region)
+            .await
+            .map_err(map_forward_err),
+        Some(raw) => {
+            let e164 = normalize_e164(&raw, region)
+                .map_err(|e| ActionError::InvalidNumber(e.to_string()))?;
+            forward
+                .set_forward(&e164, region)
+                .await
+                .map_err(map_forward_err)
+        }
+    }
+}
+
+fn map_forward_err(err: crate::modem::ModemError) -> ActionError {
+    match err {
+        crate::modem::ModemError::NotFound(msg) => ActionError::ModemUnavailable(msg),
+        crate::modem::ModemError::Failed(msg) => ActionError::ForwardFailed(msg),
+    }
 }
 
 pub async fn status(
@@ -1416,6 +1458,27 @@ mod tests {
         assert_eq!(v["modem"]["state"], "offline");
         assert_eq!(v["modem_uid"], "dwm222");
         assert_eq!(v["contacts_ok"], true);
+    }
+
+    #[tokio::test]
+    async fn put_call_forward_set_and_disable() {
+        let m = crate::modem::FakeModem::default();
+        let on = put_call_forward(&m, "IR", Some("09121234567".into()))
+            .await
+            .unwrap();
+        assert_eq!(on.e164.as_deref(), Some("+989121234567"));
+        let off = put_call_forward(&m, "IR", None).await.unwrap();
+        assert!(!off.enabled);
+    }
+
+    #[tokio::test]
+    async fn get_call_forward_maps_modem_fail() {
+        let m = crate::modem::FakeModem {
+            forward_fail: true,
+            ..Default::default()
+        };
+        let err = get_call_forward(&m, "IR").await.unwrap_err();
+        assert!(matches!(err, ActionError::ForwardFailed(_)));
     }
 
     #[tokio::test]
