@@ -156,6 +156,47 @@ unless you use `qmi-proxy`. Direct open returns `endpoint hangup`.
 
 ---
 
+## 3b. Call forwarding (optional)
+
+Telegram `/forward` and `GET`/`PUT /api/v1/call-forward` control
+**unconditional** CFU via ModemManager.
+
+1. **Preferred:** `AT+CCFC` through MM’s `Command` API — works across
+   Iranian operators (MCI, Irancell, Shatel Mobile, Aptel, …) when the
+   stick exposes AT.
+2. **Fallback:** USSD `*#21#` / `*21*…#` / `#21#` — often fails on QMI
+   sticks with `SupsFailureCase`.
+
+ModemManager **blocks** arbitrary AT unless the daemon is started with
+`--debug` (by design). Without that you get `Unauthorized: Operation only
+allowed in debug mode` and call-forward will fail when USSD is also
+broken.
+
+Enable AT for a personal gateway (verbose MM logs; fine for a home host):
+
+```bash
+sudo mkdir -p /etc/systemd/system/ModemManager.service.d
+sudo tee /etc/systemd/system/ModemManager.service.d/telesms-at-debug.conf >/dev/null <<'EOF'
+[Service]
+# Unlock mmcli/D-Bus Command (AT+CCFC) for telesms-bot call forwarding.
+ExecStart=
+ExecStart=/usr/sbin/ModemManager --debug
+EOF
+# Some distros install the binary under /usr/bin — check first:
+#   systemctl cat ModemManager | grep ExecStart
+sudo systemctl daemon-reload
+sudo systemctl restart ModemManager
+sleep 10
+mmcli -m "$MODEM_UID" --command='AT+CCFC=0,2'
+```
+
+Expect `+CCFC: …` and/or `OK`. Then restart telesms-bot and retry
+`/forward` or `GET /api/v1/call-forward`.
+
+To undo later: remove the drop-in, `daemon-reload`, restart ModemManager.
+
+---
+
 ## 4. Point the bot at it
 
 ```bash

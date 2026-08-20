@@ -53,6 +53,24 @@ fn apply_at_reply(reply: &str) -> Result<(), ModemError> {
     Ok(())
 }
 
+fn at_needs_mm_debug(err: &ModemError) -> bool {
+    let s = err.to_string();
+    s.contains("Unauthorized") || s.to_ascii_lowercase().contains("debug mode")
+}
+
+fn combine_cf_transport_errs(op: &str, at_err: &ModemError, ussd_err: &ModemError) -> ModemError {
+    if at_needs_mm_debug(at_err) {
+        return ModemError::Failed(format!(
+            "call forward {op}: ModemManager blocks AT commands unless started with --debug \
+             (required for AT+CCFC). Enable it — see docs/ubuntu-modem-setup.md \
+             (Call forwarding). USSD also failed on this modem/network: {ussd_err}"
+        ));
+    }
+    ModemError::Failed(format!(
+        "call forward {op} failed (AT: {at_err}; USSD: {ussd_err})"
+    ))
+}
+
 pub fn delete_already_gone_name(name: &str) -> bool {
     name == "org.freedesktop.DBus.Error.UnknownObject"
         || name == "org.freedesktop.ModemManager1.Error.Core.NotFound"
@@ -482,9 +500,7 @@ impl MmModem {
                 tracing::warn!(error = %at_err, "AT+CCFC query failed; trying USSD");
                 match self.ussd_roundtrip(ussd_query(), default_region).await {
                     Ok(state) => Ok(state),
-                    Err(ussd_err) => Err(ModemError::Failed(format!(
-                        "call forward query failed (AT: {at_err}; USSD: {ussd_err})"
-                    ))),
+                    Err(ussd_err) => Err(combine_cf_transport_errs("query", &at_err, &ussd_err)),
                 }
             }
         }
@@ -711,11 +727,7 @@ impl CallForward for MmModem {
             Err(at_err) => {
                 tracing::warn!(error = %at_err, "AT+CCFC enable failed; trying USSD");
                 apply_ussd_reply(self.ussd_initiate(&ussd_enable(&e164)).await).map_err(
-                    |ussd_err| {
-                        ModemError::Failed(format!(
-                            "call forward set failed (AT: {at_err}; USSD: {ussd_err})"
-                        ))
-                    },
+                    |ussd_err| combine_cf_transport_errs("set", &at_err, &ussd_err),
                 )?;
             }
         }
@@ -743,9 +755,7 @@ impl CallForward for MmModem {
             Err(at_err) => {
                 tracing::warn!(error = %at_err, "AT+CCFC disable failed; trying USSD");
                 apply_ussd_reply(self.ussd_initiate(ussd_disable()).await).map_err(|ussd_err| {
-                    ModemError::Failed(format!(
-                        "call forward disable failed (AT: {at_err}; USSD: {ussd_err})"
-                    ))
+                    combine_cf_transport_errs("disable", &at_err, &ussd_err)
                 })?;
             }
         }
@@ -789,6 +799,19 @@ mod tests {
         assert!(!sms_text_ready(""));
         assert!(sms_text_ready("hi"));
         assert!(sms_text_ready("سلام\nline"));
+    }
+
+    #[test]
+    fn combine_cf_transport_errs_mentions_mm_debug() {
+        let at = ModemError::Failed(
+            "org.freedesktop.ModemManager1.Error.Core.Unauthorized: Unauthorized: Operation only allowed in debug mode"
+                .into(),
+        );
+        let ussd = ModemError::Failed("SupsFailureCase".into());
+        let msg = combine_cf_transport_errs("query", &at, &ussd).to_string();
+        assert!(msg.contains("--debug"), "{msg}");
+        assert!(msg.contains("Call forwarding"), "{msg}");
+        assert!(msg.contains("SupsFailureCase"), "{msg}");
     }
 
     #[test]
