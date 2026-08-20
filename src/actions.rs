@@ -169,6 +169,200 @@ pub fn resolve(
     })
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChatList {
+    pub chats: Vec<ChatListItem>,
+    pub next_before: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChatListItem {
+    pub thread_id: i32,
+    pub title: String,
+    pub contact_id: Option<i64>,
+    pub display_name: Option<String>,
+    pub default_e164: Option<String>,
+    pub last_message_at: String,
+    pub last_message_preview: String,
+    pub last_message_direction: String,
+    pub unread_count: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MessageList {
+    pub thread_id: i32,
+    pub title: String,
+    pub contact_id: Option<i64>,
+    pub messages: Vec<MessageItem>,
+    pub next_before: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MessageItem {
+    pub id: String,
+    pub direction: String,
+    pub e164: String,
+    pub body: String,
+    pub timestamp: String,
+    pub sms_ts: Option<String>,
+    pub status: String,
+}
+
+fn history_limit(limit: Option<i64>) -> Result<i64, ActionError> {
+    let limit = limit.unwrap_or(50);
+    if !(1..=100).contains(&limit) {
+        return Err(ActionError::Validation("limit must be 1..=100".into()));
+    }
+    Ok(limit)
+}
+
+fn parse_history_cursor(raw: Option<&str>) -> Result<Option<String>, ActionError> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map_err(|_| ActionError::Validation("invalid cursor timestamp".into()))?;
+    Ok(Some(raw.to_string()))
+}
+
+fn history_cursors(
+    before: Option<&str>,
+    after: Option<&str>,
+) -> Result<(Option<String>, Option<String>), ActionError> {
+    let before = parse_history_cursor(before)?;
+    let after = parse_history_cursor(after)?;
+    if let (Some(before), Some(after)) = (&before, &after) {
+        let before = chrono::DateTime::parse_from_rfc3339(before)
+            .expect("history cursor was already validated");
+        let after = chrono::DateTime::parse_from_rfc3339(after)
+            .expect("history cursor was already validated");
+        if before <= after {
+            return Err(ActionError::Validation(
+                "before must be greater than after".into(),
+            ));
+        }
+    }
+    Ok((before, after))
+}
+
+pub fn list_chats(
+    db: &Db,
+    limit: Option<i64>,
+    before: Option<&str>,
+    after: Option<&str>,
+) -> Result<ChatList, ActionError> {
+    let limit = history_limit(limit)?;
+    let (before, after) = history_cursors(before, after)?;
+    let chats = db
+        .chats_with_activity(limit, before.as_deref(), after.as_deref())?
+        .into_iter()
+        .map(|chat| ChatListItem {
+            thread_id: chat.thread_id,
+            title: chat.title,
+            contact_id: chat.contact_id,
+            display_name: chat.display_name,
+            default_e164: chat.default_e164,
+            last_message_at: chat.last_message_at,
+            last_message_preview: chat.last_message_preview,
+            last_message_direction: chat.last_message_direction,
+            unread_count: None,
+        })
+        .collect::<Vec<_>>();
+    let next_before = (chats.len() == limit as usize)
+        .then(|| chats.last().map(|chat| chat.last_message_at.clone()))
+        .flatten();
+    Ok(ChatList { chats, next_before })
+}
+
+fn check_message_identity(
+    db: &Db,
+    region: &str,
+    thread_id: i32,
+    topic: Option<&Topic>,
+    number: Option<&str>,
+    contact_id: Option<i64>,
+) -> Result<(), ActionError> {
+    if thread_id == GENERAL_THREAD {
+        return if contact_id.is_some() {
+            Err(ActionError::IdentityConflict)
+        } else {
+            Ok(())
+        };
+    }
+
+    let topic = topic.expect("non-General thread was checked before identity validation");
+    if contact_id.is_some_and(|provided| topic.contact_id != Some(provided)) {
+        return Err(ActionError::IdentityConflict);
+    }
+
+    let Some(number) = number else {
+        return Ok(());
+    };
+    let e164 = normalize_e164(number, region)
+        .map_err(|error| ActionError::InvalidNumber(error.to_string()))?;
+    if topic.default_e164.as_deref() == Some(e164.as_str()) {
+        return Ok(());
+    }
+    if let Some(contact_id) = topic.contact_id {
+        if db.contact_numbers(contact_id)?.contains(&e164) {
+            return Ok(());
+        }
+    }
+    Err(ActionError::IdentityConflict)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn list_messages(
+    db: &Db,
+    region: &str,
+    thread_id: i32,
+    limit: Option<i64>,
+    before: Option<&str>,
+    after: Option<&str>,
+    number: Option<&str>,
+    contact_id: Option<i64>,
+) -> Result<MessageList, ActionError> {
+    let limit = history_limit(limit)?;
+    let (before, after) = history_cursors(before, after)?;
+    let topic = if thread_id == GENERAL_THREAD {
+        None
+    } else {
+        Some(
+            db.get_topic_by_thread(thread_id)?
+                .ok_or_else(|| ActionError::NotFound("unknown thread".into()))?,
+        )
+    };
+    check_message_identity(db, region, thread_id, topic.as_ref(), number, contact_id)?;
+
+    let messages = db
+        .messages_for_thread(thread_id, limit, before.as_deref(), after.as_deref())?
+        .into_iter()
+        .map(|message| MessageItem {
+            id: message.id,
+            direction: message.direction,
+            e164: message.e164,
+            body: message.body,
+            timestamp: message.timestamp,
+            sms_ts: message.sms_ts,
+            status: message.status,
+        })
+        .collect::<Vec<_>>();
+    let next_before = (messages.len() == limit as usize)
+        .then(|| messages.last().map(|message| message.timestamp.clone()))
+        .flatten();
+    let (title, topic_contact_id) = topic
+        .map(|topic| (topic.title, topic.contact_id))
+        .unwrap_or_else(|| ("General".into(), None));
+
+    Ok(MessageList {
+        thread_id,
+        title,
+        contact_id: topic_contact_id,
+        messages,
+        next_before,
+    })
+}
+
 pub const SEARCH_LIMIT: usize = 20;
 
 pub fn search_contacts(db: &Db, query: &str) -> Result<Vec<Contact>, ActionError> {
@@ -567,6 +761,200 @@ mod tests {
         })
         .unwrap();
         (db, id)
+    }
+
+    #[test]
+    fn list_chats_empty_ok() {
+        let db = Db::open_in_memory().unwrap();
+        let out = list_chats(&db, None, None, None).unwrap();
+        assert!(out.chats.is_empty());
+        assert!(out.next_before.is_none());
+    }
+
+    #[test]
+    fn list_chats_full_page_sets_next_before() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_inbound_at(
+            "/g",
+            "+98912",
+            "hello",
+            "2026-08-20T08:00:00Z",
+            Some(GENERAL_THREAD),
+        )
+        .unwrap();
+
+        let out = list_chats(&db, Some(1), None, None).unwrap();
+
+        assert_eq!(out.chats.len(), 1);
+        assert_eq!(out.next_before.as_deref(), Some("2026-08-20T08:00:00Z"));
+        assert!(out.chats[0].unread_count.is_none());
+    }
+
+    #[test]
+    fn list_messages_unknown_thread_404() {
+        let db = Db::open_in_memory().unwrap();
+        let err = list_messages(&db, "IR", 99, None, None, None, None, None).unwrap_err();
+        assert!(matches!(err, ActionError::NotFound(_)));
+    }
+
+    #[test]
+    fn list_messages_general_without_topic_ok() {
+        let db = Db::open_in_memory().unwrap();
+        db.record_inbound("/g", "+98912", "x", None, "", GENERAL_THREAD)
+            .unwrap();
+
+        let out = list_messages(&db, "IR", GENERAL_THREAD, None, None, None, None, None).unwrap();
+
+        assert_eq!(out.thread_id, GENERAL_THREAD);
+        assert_eq!(out.title, "General");
+        assert_eq!(out.contact_id, None);
+        assert_eq!(out.messages.len(), 1);
+    }
+
+    #[test]
+    fn list_messages_general_rejects_contact_id() {
+        let db = Db::open_in_memory().unwrap();
+        let err =
+            list_messages(&db, "IR", GENERAL_THREAD, None, None, None, None, Some(7)).unwrap_err();
+        assert!(matches!(err, ActionError::IdentityConflict));
+    }
+
+    #[test]
+    fn list_messages_general_allows_number() {
+        let db = Db::open_in_memory().unwrap();
+        let out = list_messages(
+            &db,
+            "IR",
+            GENERAL_THREAD,
+            None,
+            None,
+            None,
+            Some("09121234567"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.title, "General");
+    }
+
+    #[test]
+    fn list_messages_identity_conflict() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db.upsert_contact("people/a", "Ali").unwrap();
+        db.upsert_topic(&Topic {
+            thread_id: 42,
+            contact_id: Some(id),
+            default_e164: Some("+989121111111".into()),
+            title: "Ali".into(),
+            ignored: false,
+        })
+        .unwrap();
+        let err = list_messages(&db, "IR", 42, None, None, None, None, Some(id + 1)).unwrap_err();
+        assert!(matches!(err, ActionError::IdentityConflict));
+    }
+
+    #[test]
+    fn list_messages_accepts_contacts_secondary_number() {
+        let (db, id) = seed();
+        db.replace_contact_numbers(id, &["+989121234567".into(), "+989131234567".into()])
+            .unwrap();
+
+        let out = list_messages(
+            &db,
+            "IR",
+            9,
+            None,
+            None,
+            None,
+            Some("09131234567"),
+            Some(id),
+        )
+        .unwrap();
+
+        assert_eq!(out.contact_id, Some(id));
+    }
+
+    #[test]
+    fn list_messages_rejects_foreign_number() {
+        let (db, id) = seed();
+        let err = list_messages(
+            &db,
+            "IR",
+            9,
+            None,
+            None,
+            None,
+            Some("09139999999"),
+            Some(id),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ActionError::IdentityConflict));
+    }
+
+    #[test]
+    fn list_messages_number_only_topic_requires_default_match() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_topic(&Topic {
+            thread_id: 42,
+            contact_id: None,
+            default_e164: Some("+989121111111".into()),
+            title: "Unknown".into(),
+            ignored: false,
+        })
+        .unwrap();
+
+        let err =
+            list_messages(&db, "IR", 42, None, None, None, Some("09122222222"), None).unwrap_err();
+
+        assert!(matches!(err, ActionError::IdentityConflict));
+    }
+
+    #[test]
+    fn list_messages_maps_rows_and_sets_next_before() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_topic(&Topic {
+            thread_id: 42,
+            contact_id: None,
+            default_e164: Some("+98912".into()),
+            title: "Unknown".into(),
+            ignored: false,
+        })
+        .unwrap();
+        db.insert_inbound_at("/m", "+98912", "hello", "2026-08-20T08:00:00Z", Some(42))
+            .unwrap();
+
+        let out = list_messages(&db, "IR", 42, Some(1), None, None, None, None).unwrap();
+
+        assert_eq!(out.messages.len(), 1);
+        assert_eq!(out.messages[0].body, "hello");
+        assert_eq!(out.messages[0].direction, "in");
+        assert_eq!(out.next_before.as_deref(), Some("2026-08-20T08:00:00Z"));
+    }
+
+    #[test]
+    fn bad_limit_validation() {
+        let db = Db::open_in_memory().unwrap();
+        let err = list_chats(&db, Some(0), None, None).unwrap_err();
+        assert!(matches!(err, ActionError::Validation(_)));
+    }
+
+    #[test]
+    fn invalid_cursor_validation() {
+        let db = Db::open_in_memory().unwrap();
+        let err = list_chats(&db, None, Some("tomorrow"), None).unwrap_err();
+        assert!(matches!(err, ActionError::Validation(_)));
+    }
+
+    #[test]
+    fn before_not_after_after_validation() {
+        let db = Db::open_in_memory().unwrap();
+        let err = list_chats(
+            &db,
+            None,
+            Some("2026-08-01T00:00:00Z"),
+            Some("2026-08-02T00:00:00Z"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ActionError::Validation(_)));
     }
 
     #[test]
