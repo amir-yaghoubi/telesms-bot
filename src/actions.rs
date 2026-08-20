@@ -1382,9 +1382,10 @@ mod tests {
             &[("+989121234567".into(), "hello".into())]
         );
         assert_eq!(
-            tg.replies.lock().unwrap().last().map(|p| p.1.as_str()),
-            Some("✅")
+            tg.reactions.lock().unwrap().as_slice(),
+            &[(7, crate::app::SEND_PENDING.into()), (7, crate::app::SEND_ACK.into())]
         );
+        assert!(tg.replies.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
