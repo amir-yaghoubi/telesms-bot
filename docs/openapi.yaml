@@ -1,0 +1,580 @@
+openapi: 3.1.0
+info:
+  title: telesms-bot HTTP API
+  version: 1.0.0
+  description: |
+    JSON API surface for telesms-bot.
+    All `/api/v1/*` routes require `X-Api-Key` header.
+servers:
+  - url: http://localhost:8787
+    description: Local default
+tags:
+  - name: Health
+  - name: Status
+  - name: Contacts
+  - name: Messaging
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Liveness probe
+      description: Unauthenticated health endpoint.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    const: true
+                required: [ok]
+
+  /api/v1/status:
+    get:
+      tags: [Status]
+      summary: Gateway status snapshot
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: Current status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/search:
+    post:
+      tags: [Contacts]
+      summary: Search contacts
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SearchRequest"
+      responses:
+        "200":
+          description: Search results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  contacts:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Contact"
+                required: [contacts]
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ContactsUnavailable"
+
+  /api/v1/sms:
+    post:
+      tags: [Messaging]
+      summary: Send SMS
+      description: |
+        Send via explicit `number`, or omit `number` and target by `contact_id`.
+        `thread_id` helps select a specific topic for logging; by itself it is rejected.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SmsRequest"
+      responses:
+        "200":
+          description: Sent and acknowledged
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SmsSent"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Identity conflict or default-number required
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/ErrorResponse"
+                  - $ref: "#/components/schemas/NeedDefaultNumberError"
+        "502":
+          description: Modem or Telegram send/ack failed
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/ErrorResponse"
+                  - $ref: "#/components/schemas/TelegramFailedError"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/open:
+    post:
+      tags: [Contacts]
+      summary: Create or open a topic
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IdentityRequest"
+      responses:
+        "200":
+          description: Topic metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Opened"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/IdentityConflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/who:
+    post:
+      tags: [Contacts]
+      summary: Resolve contact/topic identity details
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IdentityRequest"
+      responses:
+        "200":
+          description: Who payload
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Who"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/IdentityConflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/number:
+    post:
+      tags: [Contacts]
+      summary: List or set default number for a topic/contact
+      description: If `default` is omitted, lists numbers. If provided, updates default.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NumberRequest"
+      responses:
+        "200":
+          description: Number state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NumberState"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/IdentityConflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/ignore:
+    post:
+      tags: [Contacts]
+      summary: Ignore a number or resolved topic numbers
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IdentityRequest"
+      responses:
+        "200":
+          description: Ignored numbers
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ignored:
+                    type: array
+                    items:
+                      type: string
+                required: [ignored]
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/IdentityConflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid API key
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            unauthorized:
+              value:
+                error: unauthorized
+                message: unauthorized
+    ValidationError:
+      description: Validation error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            validation:
+              value:
+                error: validation
+                message: query required
+    NotFound:
+      description: Requested entity or route not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            not_found:
+              value:
+                error: not_found
+                message: unknown contact
+    IdentityConflict:
+      description: Provided identity fields point to different entities
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            conflict:
+              value:
+                error: identity_conflict
+                message: identity fields disagree
+    ContactsUnavailable:
+      description: Contacts are temporarily unavailable
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            unavailable:
+              value:
+                error: contacts_unavailable
+                message: contacts unavailable
+    InternalError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    BadRequest:
+      description: Validation or identity error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+  schemas:
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+        message:
+          type: string
+      required: [error, message]
+
+    NeedDefaultNumberError:
+      allOf:
+        - $ref: "#/components/schemas/ErrorResponse"
+        - type: object
+          properties:
+            error:
+              type: string
+              enum: [need_default_number]
+            numbers:
+              type: array
+              items:
+                type: string
+          required: [error, message, numbers]
+
+    TelegramFailedError:
+      allOf:
+        - $ref: "#/components/schemas/ErrorResponse"
+        - type: object
+          properties:
+            error:
+              type: string
+              enum: [telegram_failed]
+            sent:
+              type: boolean
+          required: [error, message, sent]
+
+    IdentityRequest:
+      type: object
+      properties:
+        number:
+          type: string
+          nullable: true
+          description: Raw number or E.164.
+        contact_id:
+          type: integer
+          format: int64
+          nullable: true
+        thread_id:
+          type: integer
+          format: int32
+          nullable: true
+      additionalProperties: false
+
+    SearchRequest:
+      type: object
+      properties:
+        query:
+          type: string
+      required: [query]
+      additionalProperties: false
+
+    SmsRequest:
+      allOf:
+        - $ref: "#/components/schemas/IdentityRequest"
+        - type: object
+          properties:
+            text:
+              type: string
+          required: [text]
+          additionalProperties: false
+
+    NumberRequest:
+      allOf:
+        - $ref: "#/components/schemas/IdentityRequest"
+        - type: object
+          properties:
+            default:
+              type: string
+              nullable: true
+              description: If set, updates default; otherwise list only.
+          additionalProperties: false
+
+    Contact:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        display_name:
+          type: string
+        numbers:
+          type: array
+          items:
+            type: string
+        ambiguous:
+          type: boolean
+      required: [id, display_name, numbers, ambiguous]
+
+    SmsSent:
+      type: object
+      properties:
+        e164:
+          type: string
+        thread_id:
+          type: integer
+          format: int32
+        sent:
+          type: boolean
+      required: [e164, thread_id, sent]
+
+    Opened:
+      type: object
+      properties:
+        contact_id:
+          type: integer
+          format: int64
+          nullable: true
+        thread_id:
+          type: integer
+          format: int32
+        title:
+          type: string
+        created:
+          type: boolean
+      required: [contact_id, thread_id, title, created]
+
+    Who:
+      type: object
+      properties:
+        thread_id:
+          type: integer
+          format: int32
+        contact_id:
+          type: integer
+          format: int64
+          nullable: true
+        display_name:
+          type: string
+        numbers:
+          type: array
+          items:
+            type: string
+        default_e164:
+          type: string
+          nullable: true
+        ambiguous:
+          type: boolean
+      required: [thread_id, contact_id, display_name, numbers, default_e164, ambiguous]
+
+    NumberState:
+      type: object
+      properties:
+        thread_id:
+          type: integer
+          format: int32
+        numbers:
+          type: array
+          items:
+            type: string
+        default_e164:
+          type: string
+          nullable: true
+      required: [thread_id, numbers, default_e164]
+
+    StatusLastSms:
+      type: object
+      properties:
+        label:
+          type: string
+        when:
+          type: string
+      required: [label, when]
+
+    StatusModemOffline:
+      type: object
+      properties:
+        state:
+          type: string
+          enum: [offline]
+      required: [state]
+
+    StatusModemLive:
+      type: object
+      properties:
+        state:
+          type: string
+          description: Lowercased modem state label.
+        operator:
+          type: string
+          nullable: true
+        registration:
+          type: string
+          enum: [home, roaming]
+          nullable: true
+        signal_percent:
+          type: integer
+          minimum: 0
+          maximum: 100
+          nullable: true
+        rssi_dbm:
+          type: integer
+          nullable: true
+        access_tech:
+          type: string
+          enum: [gsm, umts, lte, nr]
+          nullable: true
+        sim:
+          type: string
+          enum: [ok, missing, pin_required]
+      required: [state, sim]
+
+    StatusResponse:
+      type: object
+      properties:
+        modem_uid:
+          type: string
+        modem:
+          oneOf:
+            - $ref: "#/components/schemas/StatusModemOffline"
+            - $ref: "#/components/schemas/StatusModemLive"
+        today_in:
+          type: integer
+        today_out_ok:
+          type: integer
+        today_out_fail:
+          type: integer
+        last_fail_error:
+          type: string
+          nullable: true
+        last_in:
+          allOf:
+            - $ref: "#/components/schemas/StatusLastSms"
+          nullable: true
+        last_out:
+          allOf:
+            - $ref: "#/components/schemas/StatusLastSms"
+          nullable: true
+        contacts_ok:
+          type: boolean
+      required:
+        - modem_uid
+        - modem
+        - today_in
+        - today_out_ok
+        - today_out_fail
+        - contacts_ok

@@ -177,8 +177,19 @@ Typing in a contact topic sends SMS to that contact’s default number.
 
 When `API_KEY` is set in the environment, the daemon also listens for JSON
 requests on `0.0.0.0:8787` (override with `API_BIND` / `API_PORT`). Send the
-key in the `X-Api-Key` header. Full request/response shapes are in
-[docs/superpowers/specs/2026-08-20-http-api-design.md](docs/superpowers/specs/2026-08-20-http-api-design.md).
+key in the `X-Api-Key` header.
+
+- OpenAPI spec: [`docs/openapi.yaml`](docs/openapi.yaml)
+- Design spec: [`docs/superpowers/specs/2026-08-20-http-api-design.md`](docs/superpowers/specs/2026-08-20-http-api-design.md)
+
+Preview the OpenAPI spec in Swagger UI:
+
+```bash
+chmod +x scripts/openapi-preview.sh
+./scripts/openapi-preview.sh
+```
+
+Then open `http://localhost:8080`.
 
 | Route | Method | What it does |
 |---|---|---|
