@@ -71,7 +71,7 @@ pub fn resolve(
         None => None,
     };
 
-    if e164.is_none() && id.contact_id.is_none() {
+    if e164.is_none() && id.contact_id.is_none() && id.thread_id.is_none() {
         return Err(ActionError::MissingIdentity);
     }
 
@@ -439,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn thread_alone_missing_identity() {
+    fn thread_alone_unknown_topic() {
         let db = Db::open_in_memory().unwrap();
         let err = resolve(
             &db,
@@ -451,7 +451,7 @@ mod tests {
             ResolveMode::RequireTopic,
         )
         .unwrap_err();
-        assert!(matches!(err, ActionError::MissingIdentity));
+        assert!(matches!(err, ActionError::NotFound(_)));
     }
 
     #[test]

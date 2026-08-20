@@ -130,9 +130,9 @@ pub(crate) async fn handle_num_callback(
         return Ok(());
     };
     let identity = Identity {
-        number: Some(e164.to_string()),
         contact_id: topic.contact_id,
         thread_id: Some(thread_id),
+        number: None,
     };
     match set_default_number(db, region, &identity, e164, tg).await {
         Ok(_) => {}
@@ -267,14 +267,17 @@ pub(crate) async fn handle_ignore(
         Identity::default()
     };
 
+    const IGNORE_HINT: &str = "reply to a +number to ignore it";
     match ignore(db, region, &identity, tg).await {
         Ok(_) => Ok(()),
-        Err(ActionError::Validation(_)) if thread_id == GENERAL_THREAD => {
-            tg.post(
-                thread_id,
-                "reply to a +number to ignore it".to_string(),
-            )
-            .await?;
+        Err(ActionError::Validation(_)) | Err(ActionError::MissingIdentity)
+            if thread_id == GENERAL_THREAD =>
+        {
+            tg.post(thread_id, IGNORE_HINT.to_string()).await?;
+            Ok(())
+        }
+        Err(ActionError::Validation(_)) => {
+            tg.post(thread_id, IGNORE_HINT.to_string()).await?;
             Ok(())
         }
         Err(ActionError::Db(e)) => Err(e.into()),

@@ -243,6 +243,77 @@ async fn ignore_contact_topic_ignores_all_numbers() {
 }
 
 #[tokio::test]
+async fn ignore_general_without_reply_posts_hint() {
+    let db = Db::open_in_memory().unwrap();
+    let tg = FakeTg::new();
+    handle_ignore(&db, "IR", 1, None, &tg).await.unwrap();
+    assert_eq!(
+        tg.posts.lock().unwrap().as_slice(),
+        &[(1, "reply to a +number to ignore it".into())]
+    );
+}
+
+#[tokio::test]
+async fn ignore_contact_topic_empty_numbers_posts_hint() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db.upsert_contact("people/a", "Ali").unwrap();
+    db.upsert_topic(&Topic {
+        thread_id: 9,
+        contact_id: Some(id),
+        default_e164: None,
+        title: "Ali".into(),
+        ignored: false,
+    })
+    .unwrap();
+    let tg = FakeTg::new();
+    handle_ignore(&db, "IR", 9, None, &tg).await.unwrap();
+    assert_eq!(
+        tg.posts.lock().unwrap().as_slice(),
+        &[(9, "reply to a +number to ignore it".into())]
+    );
+}
+
+#[tokio::test]
+async fn num_callback_avoids_identity_conflict() {
+    let db = Db::open_in_memory().unwrap();
+    let id = db.upsert_contact("people/a", "Ali").unwrap();
+    db.replace_contact_numbers(id, &["+98912".into(), "+98913".into()])
+        .unwrap();
+    db.upsert_topic(&Topic {
+        thread_id: 9,
+        contact_id: Some(id),
+        default_e164: Some("+98912".into()),
+        title: "Ali".into(),
+        ignored: false,
+    })
+    .unwrap();
+    db.upsert_topic(&Topic {
+        thread_id: 10,
+        contact_id: None,
+        default_e164: Some("+98913".into()),
+        title: "+98913".into(),
+        ignored: false,
+    })
+    .unwrap();
+    let tg = FakeTg::new();
+    handle_num_callback(&db, "IR", 9, "+98913", None, &tg, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.get_topic_by_thread(9)
+            .unwrap()
+            .unwrap()
+            .default_e164
+            .as_deref(),
+        Some("+98913")
+    );
+    assert_eq!(
+        tg.posts.lock().unwrap().as_slice(),
+        &[(9, "default is +98913".into())]
+    );
+}
+
+#[tokio::test]
 async fn ignore_general_reply_parses_plus() {
     let db = Db::open_in_memory().unwrap();
     let tg = FakeTg::new();
