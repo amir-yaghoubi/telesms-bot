@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{FromRequest, Request, State};
+use axum::extract::{FromRequest, Path, Query, Request, State};
 use axum::extract::rejection::JsonRejection;
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
@@ -41,6 +41,8 @@ pub fn router(state: HttpState) -> Router {
         .route("/who", post(who_handler))
         .route("/number", post(number_handler))
         .route("/ignore", post(ignore_handler))
+        .route("/chats", get(chats_handler))
+        .route("/chats/{thread_id}/messages", get(chat_messages_handler))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .method_not_allowed_fallback(api_method_not_allowed)
         .fallback(api_not_found);
@@ -480,6 +482,50 @@ async fn ignore_handler(
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct HistoryQuery {
+    limit: Option<i64>,
+    before: Option<String>,
+    after: Option<String>,
+    number: Option<String>,
+    contact_id: Option<i64>,
+}
+
+async fn chats_handler(
+    State(state): State<HttpState>,
+    Query(q): Query<HistoryQuery>,
+) -> Response {
+    match actions::list_chats(
+        state.db.as_ref(),
+        q.limit,
+        q.before.as_deref(),
+        q.after.as_deref(),
+    ) {
+        Ok(body) => (StatusCode::OK, Json(body)).into_response(),
+        Err(err) => action_to_response(err).into_response(),
+    }
+}
+
+async fn chat_messages_handler(
+    State(state): State<HttpState>,
+    Path(thread_id): Path<i32>,
+    Query(q): Query<HistoryQuery>,
+) -> Response {
+    match actions::list_messages(
+        state.db.as_ref(),
+        &state.cfg.default_region,
+        thread_id,
+        q.limit,
+        q.before.as_deref(),
+        q.after.as_deref(),
+        q.number.as_deref(),
+        q.contact_id,
+    ) {
+        Ok(body) => (StatusCode::OK, Json(body)).into_response(),
+        Err(err) => action_to_response(err).into_response(),
+    }
+}
+
 fn sms_sent_json(s: &SmsSent) -> Value {
     json!({
         "e164": s.e164,
@@ -744,5 +790,107 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn chats_requires_api_key() {
+        let app = test_router("secret");
+        let res = call(
+            app,
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/api/v1/chats")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn chats_empty_ok() {
+        let app = test_router("secret");
+        let res = call(
+            app,
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/api/v1/chats")
+                .header("X-Api-Key", "secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert_eq!(v["chats"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn messages_unknown_thread_404() {
+        let app = test_router("secret");
+        let res = call(
+            app,
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/api/v1/chats/99/messages")
+                .header("X-Api-Key", "secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let v = body_json(res).await;
+        assert_eq!(v["error"], "not_found");
+    }
+
+    fn test_router_with_inbound(api_key: &str) -> Router {
+        let db = Arc::new({
+            let db = Db::open_in_memory().unwrap();
+            let id = db.upsert_contact("people/a", "Ali").unwrap();
+            db.replace_contact_numbers(id, &["+989121234567".into()])
+                .unwrap();
+            db.upsert_topic(&Topic {
+                thread_id: 9,
+                contact_id: Some(id),
+                default_e164: Some("+989121234567".into()),
+                title: "Ali".into(),
+                ignored: false,
+            })
+            .unwrap();
+            db.record_inbound("/g", "+989121234567", "hello", None, "", 9)
+                .unwrap();
+            db
+        });
+        let modem = Arc::new(FakeModem::default());
+        let info = modem.clone() as Arc<dyn ModemInfo>;
+        let modem = modem as Arc<dyn SmsModem>;
+        let tg = Arc::new(FakeTg::new()) as Arc<dyn TelegramSink>;
+        router(HttpState {
+            cfg: test_config(api_key),
+            db,
+            modem,
+            info,
+            tg,
+        })
+    }
+
+    #[tokio::test]
+    async fn messages_known_thread_ok() {
+        let app = test_router_with_inbound("secret");
+        let res = call(
+            app,
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/api/v1/chats/9/messages")
+                .header("X-Api-Key", "secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert_eq!(v["thread_id"], 9);
+        assert_eq!(v["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(v["messages"][0]["body"], "hello");
     }
 }
