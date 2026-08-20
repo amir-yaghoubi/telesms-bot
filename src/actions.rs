@@ -329,6 +329,82 @@ pub async fn ignore(
     Ok(targets)
 }
 
+#[derive(Debug, Clone)]
+pub struct Opened {
+    pub contact_id: Option<i64>,
+    pub thread_id: i32,
+    pub title: String,
+    pub created: bool,
+}
+
+pub async fn open_topic(
+    db: &Db,
+    region: &str,
+    id: &Identity,
+    tg: &dyn TelegramSink,
+) -> Result<Opened, ActionError> {
+    let id = Identity {
+        thread_id: None,
+        ..id.clone()
+    };
+    let resolved = resolve(db, region, &id, ResolveMode::Open)?;
+
+    if let Some(topic) = resolved.topic {
+        return Ok(Opened {
+            contact_id: topic.contact_id,
+            thread_id: topic.thread_id,
+            title: topic.title,
+            created: false,
+        });
+    }
+
+    if let Some(contact) = resolved.contact {
+        let default_e164 = if contact.numbers.len() == 1 {
+            contact.numbers.first().cloned()
+        } else {
+            None
+        };
+        let title = match contact.numbers.first() {
+            Some(n) => crate::route::topic_title(&contact.display_name, n),
+            None => contact.display_name.clone(),
+        };
+        let thread_id = tg.create_topic(title.clone()).await?;
+        db.upsert_topic(&Topic {
+            thread_id,
+            contact_id: Some(contact.id),
+            default_e164,
+            title: title.clone(),
+            ignored: false,
+        })?;
+        return Ok(Opened {
+            contact_id: Some(contact.id),
+            thread_id,
+            title,
+            created: true,
+        });
+    }
+
+    if let Some(e164) = resolved.e164 {
+        let title = e164.clone();
+        let thread_id = tg.create_topic(title.clone()).await?;
+        db.upsert_topic(&Topic {
+            thread_id,
+            contact_id: None,
+            default_e164: Some(e164),
+            title: title.clone(),
+            ignored: false,
+        })?;
+        return Ok(Opened {
+            contact_id: None,
+            thread_id,
+            title,
+            created: true,
+        });
+    }
+
+    Err(ActionError::NotFound("unknown contact".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,6 +662,66 @@ mod tests {
             tg.posts.lock().unwrap().as_slice(),
             &[(9, "default is +98913".into())]
         );
+    }
+
+    #[tokio::test]
+    async fn open_existing_does_not_create() {
+        let (db, id) = seed();
+        let tg = crate::app::FakeTg::new();
+        let o = open_topic(
+            &db,
+            "IR",
+            &Identity {
+                contact_id: Some(id),
+                ..Default::default()
+            },
+            &tg,
+        )
+        .await
+        .unwrap();
+        assert!(!o.created);
+        assert_eq!(o.thread_id, 9);
+    }
+
+    #[tokio::test]
+    async fn open_creates_for_contact() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db.upsert_contact("people/a", "Ali").unwrap();
+        db.replace_contact_numbers(id, &["+989121234567".into()])
+            .unwrap();
+        let tg = crate::app::FakeTg::new();
+        let o = open_topic(
+            &db,
+            "IR",
+            &Identity {
+                contact_id: Some(id),
+                ..Default::default()
+            },
+            &tg,
+        )
+        .await
+        .unwrap();
+        assert!(o.created);
+        assert!(db.get_topic_by_contact(id).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn open_unknown_number_creates_title() {
+        let db = Db::open_in_memory().unwrap();
+        let tg = crate::app::FakeTg::new();
+        let o = open_topic(
+            &db,
+            "IR",
+            &Identity {
+                number: Some("09120000000".into()),
+                ..Default::default()
+            },
+            &tg,
+        )
+        .await
+        .unwrap();
+        assert!(o.created);
+        assert!(o.title.starts_with('+'));
     }
 
     #[tokio::test]

@@ -6,12 +6,12 @@ use teloxide::error_handlers::LoggingErrorHandler;
 use teloxide::prelude::*;
 use teloxide::types::{BotCommandScope, CallbackQuery, ChatId, InlineQuery, MessageId, ParseMode};
 
-use crate::actions::{ignore, list_numbers, search_contacts, set_default_number, who, ActionError, Identity};
+use crate::actions::{ignore, list_numbers, open_topic, search_contacts, set_default_number, who, ActionError, Identity};
 use crate::app::{handle_owner_text, send_and_ack, AppError, OwnerTextOutcome, TelegramSink};
 use crate::config::Config;
 use crate::db::{Contact, Db, Topic};
 use crate::modem::SmsModem;
-use crate::route::{route_for_send, topic_title, InboundDest, GENERAL_THREAD};
+use crate::route::{route_for_send, InboundDest, GENERAL_THREAD};
 use crate::normalize::normalize_e164;
 
 use super::keyboards::{
@@ -212,37 +212,32 @@ pub(crate) async fn handle_open(
     contact_id: i64,
     tg: &dyn TelegramSink,
 ) -> Result<(), AppError> {
-    if let Some(topic) = db.get_topic_by_contact(contact_id)? {
-        tg.post(reply_thread, topic_open_message(group_id, &topic))
-            .await?;
-        return Ok(());
+    match open_topic(
+        db,
+        "",
+        &Identity {
+            contact_id: Some(contact_id),
+            ..Default::default()
+        },
+        tg,
+    )
+    .await
+    {
+        Ok(opened) => {
+            let topic = db
+                .get_topic_by_thread(opened.thread_id)?
+                .ok_or_else(|| AppError::Telegram("topic missing after open".into()))?;
+            tg.post(reply_thread, topic_open_message(group_id, &topic))
+                .await?;
+            Ok(())
+        }
+        Err(ActionError::NotFound(_)) => {
+            tg.post(reply_thread, "unknown contact".to_string()).await?;
+            Ok(())
+        }
+        Err(ActionError::Db(e)) => Err(e.into()),
+        Err(e) => Err(AppError::Telegram(e.to_string())),
     }
-    let Some(contact) = db.get_contact(contact_id)? else {
-        tg.post(reply_thread, "unknown contact".to_string()).await?;
-        return Ok(());
-    };
-    let default_e164 = if contact.numbers.len() == 1 {
-        contact.numbers.first().cloned()
-    } else {
-        None
-    };
-    let title = match contact.numbers.first() {
-        Some(n) => topic_title(&contact.display_name, n),
-        None => contact.display_name.clone(),
-    };
-    let topic = Topic {
-        thread_id: 0,
-        contact_id: Some(contact.id),
-        default_e164,
-        title: title.clone(),
-        ignored: false,
-    };
-    let thread_id = tg.create_topic(title).await?;
-    let topic = Topic { thread_id, ..topic };
-    db.upsert_topic(&topic)?;
-    tg.post(reply_thread, topic_open_message(group_id, &topic))
-        .await?;
-    Ok(())
 }
 
 pub(crate) async fn handle_ignore(
