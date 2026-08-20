@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: telesms-bot HTTP API
-  version: 1.0.0
+  version: 1.1.0
   description: |
     JSON API surface for telesms-bot.
     All `/api/v1/*` routes require `X-Api-Key` header.
@@ -13,6 +13,7 @@ tags:
   - name: Status
   - name: Contacts
   - name: Messaging
+  - name: History
 paths:
   /health:
     get:
@@ -256,12 +257,116 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /api/v1/chats:
+    get:
+      tags: [History]
+      summary: List recent chats with SMS activity
+      description: |
+        Topics with at least one SMS record, newest activity first.
+        Unknown numbers without a contact topic are bucketed into General (`thread_id = 1`).
+        `unread_count` is always null in v1.
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: "#/components/parameters/HistoryLimit"
+        - $ref: "#/components/parameters/HistoryBefore"
+        - $ref: "#/components/parameters/HistoryAfter"
+      responses:
+        "200":
+          description: Chat inbox page
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatList"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/chats/{thread_id}/messages:
+    get:
+      tags: [History]
+      summary: SMS timeline for a forum thread
+      description: |
+        `thread_id = 1` is always General (no topics row required).
+        For any other id, an unknown thread returns 404.
+        Includes all recorded SMS: inbound, outbound success, and outbound failure.
+        Optional `number` / `contact_id` query params are consistency checks; mismatch returns 409.
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: thread_id
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int32
+        - $ref: "#/components/parameters/HistoryLimit"
+        - $ref: "#/components/parameters/HistoryBefore"
+        - $ref: "#/components/parameters/HistoryAfter"
+        - name: number
+          in: query
+          description: Optional E.164 consistency check against the thread.
+          schema:
+            type: string
+        - name: contact_id
+          in: query
+          description: Optional contact id consistency check against the thread.
+          schema:
+            type: integer
+            format: int64
+      responses:
+        "200":
+          description: Message timeline page
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/IdentityConflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
 components:
   securitySchemes:
     ApiKeyAuth:
       type: apiKey
       in: header
       name: X-Api-Key
+
+  parameters:
+    HistoryLimit:
+      name: limit
+      in: query
+      description: Page size (default 50, max 100).
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+        maximum: 100
+        default: 50
+    HistoryBefore:
+      name: before
+      in: query
+      description: RFC 3339 timestamp; return rows strictly before this cursor.
+      schema:
+        type: string
+        format: date-time
+    HistoryAfter:
+      name: after
+      in: query
+      description: RFC 3339 timestamp; return rows strictly after this cursor.
+      schema:
+        type: string
+        format: date-time
 
   responses:
     Unauthorized:
@@ -495,6 +600,112 @@ components:
           type: string
           nullable: true
       required: [thread_id, numbers, default_e164]
+
+    ChatList:
+      type: object
+      properties:
+        chats:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChatListItem"
+        next_before:
+          type: string
+          format: date-time
+          nullable: true
+          description: Last item's last_message_at when another page may exist; null otherwise.
+      required: [chats, next_before]
+
+    ChatListItem:
+      type: object
+      properties:
+        thread_id:
+          type: integer
+          format: int32
+        title:
+          type: string
+        contact_id:
+          type: integer
+          format: int64
+          nullable: true
+        display_name:
+          type: string
+          nullable: true
+        default_e164:
+          type: string
+          nullable: true
+        last_message_at:
+          type: string
+          format: date-time
+        last_message_preview:
+          type: string
+        last_message_direction:
+          type: string
+          description: '"in" or "out".'
+        unread_count:
+          type: integer
+          format: int64
+          nullable: true
+          description: Always null in v1.
+      required:
+        - thread_id
+        - title
+        - contact_id
+        - display_name
+        - default_e164
+        - last_message_at
+        - last_message_preview
+        - last_message_direction
+        - unread_count
+
+    MessageList:
+      type: object
+      properties:
+        thread_id:
+          type: integer
+          format: int32
+        title:
+          type: string
+        contact_id:
+          type: integer
+          format: int64
+          nullable: true
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/MessageItem"
+        next_before:
+          type: string
+          format: date-time
+          nullable: true
+          description: Last message timestamp when another page may exist; null otherwise.
+      required: [thread_id, title, contact_id, messages, next_before]
+
+    MessageItem:
+      type: object
+      properties:
+        id:
+          type: string
+          description: '"in:<rowid>" or "out:<rowid>".'
+        direction:
+          type: string
+          enum: [in, out]
+        e164:
+          type: string
+        body:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+          description: Log created_at (ISO-8601).
+        sms_ts:
+          type: string
+          format: date-time
+          nullable: true
+          description: Modem-reported original time when present; otherwise null.
+        status:
+          type: string
+          enum: [ok, failed]
+      required: [id, direction, e164, body, timestamp, sms_ts, status]
 
     StatusLastSms:
       type: object

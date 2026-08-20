@@ -181,6 +181,7 @@ key in the `X-Api-Key` header.
 
 - OpenAPI spec: [`docs/openapi.yaml`](docs/openapi.yaml)
 - Design spec: [`docs/superpowers/specs/2026-08-20-http-api-design.md`](docs/superpowers/specs/2026-08-20-http-api-design.md)
+- Chat history spec: [`docs/superpowers/specs/2026-08-20-chat-history-api-design.md`](docs/superpowers/specs/2026-08-20-chat-history-api-design.md)
 
 Preview the OpenAPI spec in Swagger UI:
 
@@ -201,6 +202,8 @@ Then open `http://localhost:8080`.
 | `/api/v1/who` | POST | Contact name, numbers, default |
 | `/api/v1/number` | POST | List or set the default number |
 | `/api/v1/ignore` | POST | Ignore a number |
+| `/api/v1/chats` | GET | Recent chats with SMS activity |
+| `/api/v1/chats/{thread_id}/messages` | GET | SMS timeline for a forum thread |
 
 ---
 
