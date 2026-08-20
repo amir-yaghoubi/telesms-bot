@@ -1,5 +1,6 @@
 use chrono::{Datelike, Utc};
 use chrono_tz::Tz;
+use serde::Serialize;
 
 use crate::db::Db;
 use crate::modem::{ModemInfo, ModemLive, ModemState, Radio, Registration, SimStatus};
@@ -12,6 +13,122 @@ pub enum ModemView {
 pub struct LastSms {
     pub label: String,
     pub when: String,
+}
+
+#[derive(Serialize)]
+pub struct LastSmsJson<'a> {
+    pub label: &'a str,
+    pub when: &'a str,
+}
+
+#[derive(Serialize)]
+pub struct OfflineModemJson {
+    pub state: &'static str,
+}
+
+#[derive(Serialize)]
+pub struct LiveModemJson<'a> {
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operator: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registration: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signal_percent: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rssi_dbm: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_tech: Option<&'static str>,
+    pub sim: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum ModemJson<'a> {
+    Offline(OfflineModemJson),
+    Live(LiveModemJson<'a>),
+}
+
+#[derive(Serialize)]
+pub struct StatusJson<'a> {
+    pub modem_uid: &'a str,
+    pub modem: ModemJson<'a>,
+    pub today_in: u32,
+    pub today_out_ok: u32,
+    pub today_out_fail: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_fail_error: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_in: Option<LastSmsJson<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_out: Option<LastSmsJson<'a>>,
+    pub contacts_ok: bool,
+}
+
+fn radio_json(radio: Radio) -> &'static str {
+    match radio {
+        Radio::Gsm => "gsm",
+        Radio::Umts => "umts",
+        Radio::Lte => "lte",
+        Radio::Nr => "nr",
+    }
+}
+
+fn sim_json(sim: SimStatus) -> &'static str {
+    match sim {
+        SimStatus::Ok => "ok",
+        SimStatus::Missing => "missing",
+        SimStatus::PinRequired => "pin_required",
+    }
+}
+
+fn registration_json(reg: Registration) -> &'static str {
+    match reg {
+        Registration::Home => "home",
+        Registration::Roaming => "roaming",
+    }
+}
+
+fn live_modem_json(live: &ModemLive) -> LiveModemJson<'_> {
+    LiveModemJson {
+        state: live.state.label().to_ascii_lowercase(),
+        operator: live.operator.as_deref(),
+        registration: live.registration.map(registration_json),
+        signal_percent: live.signal_percent,
+        rssi_dbm: live.rssi_dbm,
+        access_tech: live.access_tech.map(radio_json),
+        sim: sim_json(live.sim),
+    }
+}
+
+pub fn status_json_from_snapshot(snap: &StatusSnapshot) -> StatusJson<'_> {
+    let modem = match &snap.modem {
+        ModemView::Offline => ModemJson::Offline(OfflineModemJson { state: "offline" }),
+        ModemView::Live(live) => ModemJson::Live(live_modem_json(live)),
+    };
+    StatusJson {
+        modem_uid: &snap.modem_uid,
+        modem,
+        today_in: snap.today_in,
+        today_out_ok: snap.today_out_ok,
+        today_out_fail: snap.today_out_fail,
+        last_fail_error: snap.last_fail_error.as_deref(),
+        last_in: snap
+            .last_in
+            .as_ref()
+            .map(|s| LastSmsJson {
+                label: &s.label,
+                when: &s.when,
+            }),
+        last_out: snap
+            .last_out
+            .as_ref()
+            .map(|s| LastSmsJson {
+                label: &s.label,
+                when: &s.when,
+            }),
+        contacts_ok: snap.contacts_ok,
+    }
 }
 
 pub struct StatusSnapshot {

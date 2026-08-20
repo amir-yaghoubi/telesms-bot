@@ -535,6 +535,18 @@ pub async fn send_sms(
     })
 }
 
+pub async fn status(
+    modem: &dyn crate::modem::ModemInfo,
+    db: &Db,
+    tz: chrono_tz::Tz,
+    modem_uid: &str,
+) -> Result<serde_json::Value, ActionError> {
+    let snap =
+        crate::status::gather(modem, db, tz, modem_uid, chrono::Utc::now()).await?;
+    Ok(serde_json::to_value(crate::status::status_json_from_snapshot(&snap))
+        .expect("StatusJson serializes"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -953,6 +965,18 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, ActionError::ModemFailed(_)));
+    }
+
+    #[tokio::test]
+    async fn status_offline_json() {
+        let db = Db::open_in_memory().unwrap();
+        let modem = crate::modem::FakeModem::default();
+        let v = status(&modem, &db, chrono_tz::UTC, "dwm222")
+            .await
+            .unwrap();
+        assert_eq!(v["modem"]["state"], "offline");
+        assert_eq!(v["modem_uid"], "dwm222");
+        assert_eq!(v["contacts_ok"], true);
     }
 
     #[tokio::test]
