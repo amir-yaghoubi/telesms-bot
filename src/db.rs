@@ -64,6 +64,7 @@ pub struct Db {
     contacts_available: AtomicBool,
 }
 
+#[derive(Clone, Debug)]
 pub struct Contact {
     pub id: i64,
     pub google_resource: String,
@@ -72,6 +73,7 @@ pub struct Contact {
     pub ambiguous: bool,
 }
 
+#[derive(Clone, Debug)]
 pub struct Topic {
     pub thread_id: i32,
     pub contact_id: Option<i64>,
