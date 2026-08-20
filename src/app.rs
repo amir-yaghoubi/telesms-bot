@@ -539,10 +539,23 @@ pub async fn send_and_ack(
     tg: &dyn TelegramSink,
     delete_enabled: bool,
 ) -> Result<(), ActionError> {
+    if let Some(id) = reply_to {
+        if let Err(err) = tg.react(id, SEND_PENDING).await {
+            return Err(ActionError::TelegramFailed {
+                sent: false,
+                message: err.to_string(),
+            });
+        }
+    }
+
     match modem.send(e164, text).await {
         Ok(path) => {
             db.record_outbound(e164, text, "ok", thread_id)?;
-            if let Err(err) = ack_send(tg, thread_id, SEND_ACK, reply_to).await {
+            let ack_result = match reply_to {
+                Some(id) => tg.react(id, SEND_ACK).await,
+                None => ack_send(tg, thread_id, SEND_ACK, None).await,
+            };
+            if let Err(err) = ack_result {
                 return Err(ActionError::TelegramFailed {
                     sent: true,
                     message: err.to_string(),
@@ -554,6 +567,9 @@ pub async fn send_and_ack(
         Err(err) => {
             let err_s = err.to_string();
             db.record_outbound(e164, text, &err_s, thread_id)?;
+            if let Some(id) = reply_to {
+                let _ = tg.react(id, SEND_FAIL).await;
+            }
             let _ = ack_send(tg, thread_id, &err_s, reply_to).await;
             Err(ActionError::ModemFailed(err_s))
         }
@@ -801,9 +817,10 @@ mod tests {
         let sent = modem.sent.lock().unwrap();
         assert_eq!(sent.as_slice(), &[("+989121234567".into(), "hello".into())]);
         assert_eq!(
-            tg.replies.lock().unwrap().as_slice(),
-            &[(42, "✅".into(), 7)]
+            tg.reactions.lock().unwrap().as_slice(),
+            &[(7, SEND_PENDING.into()), (7, SEND_ACK.into())]
         );
+        assert!(tg.replies.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -859,7 +876,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_and_ack_ok_records_replies_and_deletes() {
+    async fn send_and_ack_ok_reacts_and_deletes() {
         let db = Db::open_in_memory().unwrap();
         let tg = FakeTg::new();
         let modem = FakeModem::default();
@@ -871,14 +888,54 @@ mod tests {
             &[("+98912".into(), "hi".into())]
         );
         assert_eq!(
-            tg.replies.lock().unwrap().as_slice(),
-            &[(42, SEND_ACK.into(), 7)]
+            tg.reactions.lock().unwrap().as_slice(),
+            &[(7, SEND_PENDING.into()), (7, SEND_ACK.into())]
         );
+        assert!(tg.replies.lock().unwrap().is_empty());
+        assert!(tg.posts.lock().unwrap().is_empty());
         assert_eq!(
             modem.deleted.lock().unwrap().as_slice(),
             &["/fake/sms/1".into()] as &[String]
         );
         assert_eq!(db.last_outbound_ok().unwrap().unwrap().0, "+98912");
+    }
+
+    #[tokio::test]
+    async fn send_and_ack_ok_without_reply_to_posts_ack() {
+        let db = Db::open_in_memory().unwrap();
+        let tg = FakeTg::new();
+        let modem = FakeModem::default();
+        send_and_ack(&db, "+98912", "hi", 42, None, &modem, &tg, true)
+            .await
+            .unwrap();
+        assert!(tg.reactions.lock().unwrap().is_empty());
+        assert_eq!(
+            tg.posts.lock().unwrap().as_slice(),
+            &[(42, SEND_ACK.into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn send_and_ack_err_reacts_fail_and_replies_error() {
+        let db = Db::open_in_memory().unwrap();
+        let tg = FakeTg::new();
+        let modem = FakeModem {
+            fail: true,
+            ..FakeModem::default()
+        };
+        let err = send_and_ack(&db, "+98912", "hi", 42, Some(7), &modem, &tg, true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ActionError::ModemFailed(_)));
+        assert_eq!(
+            tg.reactions.lock().unwrap().as_slice(),
+            &[(7, SEND_PENDING.into()), (7, SEND_FAIL.into())]
+        );
+        assert_eq!(
+            tg.replies.lock().unwrap().as_slice(),
+            &[(42, "modem error: error".into(), 7)]
+        );
+        assert!(modem.deleted.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -893,11 +950,30 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ActionError::ModemFailed(_)));
+        assert!(tg.reactions.lock().unwrap().is_empty());
         assert!(modem.deleted.lock().unwrap().is_empty());
         assert_eq!(
             tg.posts.lock().unwrap().as_slice(),
             &[(42, "modem error: error".into())]
         );
+    }
+
+    #[tokio::test]
+    async fn send_and_ack_pending_react_fail_skips_modem() {
+        let db = Db::open_in_memory().unwrap();
+        let tg = FakeTg {
+            fail: true,
+            ..FakeTg::new()
+        };
+        let modem = FakeModem::default();
+        let err = send_and_ack(&db, "+98912", "hi", 42, Some(7), &modem, &tg, true)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ActionError::TelegramFailed { sent: false, .. }
+        ));
+        assert!(modem.sent.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -962,8 +1038,12 @@ mod tests {
         handle_owner_text(&db, "IR", 42, "hello", Some(7), &modem, &tg, true)
             .await
             .unwrap();
+        assert_eq!(
+            tg.reactions.lock().unwrap().as_slice(),
+            &[(7, SEND_PENDING.into()), (7, SEND_FAIL.into())]
+        );
         let replies = tg.replies.lock().unwrap();
-        assert!(replies[0].1.contains("error") || !replies[0].1.contains("✅"));
+        assert!(replies[0].1.contains("error"));
         assert_eq!(replies[0].2, 7);
     }
 
