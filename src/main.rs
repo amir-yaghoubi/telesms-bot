@@ -10,7 +10,7 @@ use telesms_bot::app::{sweep_old_sms, watch_inbox, watch_modem, TelegramSink};
 use telesms_bot::config::Config;
 use telesms_bot::db::Db;
 use telesms_bot::google::GooglePeople;
-use telesms_bot::modem::SmsModem;
+use telesms_bot::modem::{CallForward, SmsModem};
 use telesms_bot::modem_mm::MmModem;
 use telesms_bot::telegram::{self, RealTg};
 
@@ -117,6 +117,7 @@ async fn run_daemon() {
     ));
 
     let info: Arc<dyn telesms_bot::modem::ModemInfo> = mm.clone();
+    let forward: Arc<dyn CallForward> = mm.clone();
 
     if cfg.api_enabled() {
         let bind: std::net::SocketAddr = format!("{}:{}", cfg.api_bind, cfg.api_port)
@@ -127,6 +128,7 @@ async fn run_daemon() {
             db: db.clone(),
             modem: modem.clone(),
             info: info.clone(),
+            forward: forward.clone(),
             tg: tg.clone(),
         };
         let cancel_http = cancel.clone();
@@ -163,7 +165,7 @@ async fn run_daemon() {
         });
     }
 
-    telegram::dispatch(cfg, db, modem, info).await;
+    telegram::dispatch(cfg, db, modem, info, forward).await;
     cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
         while tasks.join_next().await.is_some() {}

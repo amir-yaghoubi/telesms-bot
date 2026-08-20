@@ -20,7 +20,7 @@ use crate::actions::{
 use crate::app::TelegramSink;
 use crate::config::Config;
 use crate::db::Db;
-use crate::modem::{ModemInfo, SmsModem};
+use crate::modem::{CallForward, ModemInfo, SmsModem};
 use crate::route::GENERAL_THREAD;
 
 #[derive(Clone)]
@@ -29,6 +29,7 @@ pub struct HttpState {
     pub db: Arc<Db>,
     pub modem: Arc<dyn SmsModem>,
     pub info: Arc<dyn ModemInfo>,
+    pub forward: Arc<dyn CallForward>,
     pub tg: Arc<dyn TelegramSink>,
 }
 
@@ -320,6 +321,8 @@ async fn not_found() -> impl IntoResponse {
 async fn status_handler(State(state): State<HttpState>) -> Response {
     match actions::status(
         state.info.as_ref(),
+        state.forward.as_ref(),
+        &state.cfg.default_region,
         state.db.as_ref(),
         state.cfg.status_tz,
         &state.cfg.modem_uid,
@@ -665,6 +668,7 @@ mod tests {
         });
         let modem = Arc::new(FakeModem::default());
         let info = modem.clone() as Arc<dyn ModemInfo>;
+        let forward = modem.clone() as Arc<dyn CallForward>;
         let modem = modem as Arc<dyn SmsModem>;
         let tg = Arc::new(FakeTg::new()) as Arc<dyn TelegramSink>;
         router(HttpState {
@@ -672,6 +676,7 @@ mod tests {
             db,
             modem,
             info,
+            forward,
             tg,
         })
     }
@@ -947,6 +952,7 @@ mod tests {
         });
         let modem = Arc::new(FakeModem::default());
         let info = modem.clone() as Arc<dyn ModemInfo>;
+        let forward = modem.clone() as Arc<dyn CallForward>;
         let modem = modem as Arc<dyn SmsModem>;
         let tg = Arc::new(FakeTg::new()) as Arc<dyn TelegramSink>;
         router(HttpState {
@@ -954,6 +960,7 @@ mod tests {
             db,
             modem,
             info,
+            forward,
             tg,
         })
     }

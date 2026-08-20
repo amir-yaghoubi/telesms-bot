@@ -10,7 +10,7 @@ use crate::actions::{ignore, list_numbers, open_topic, search_contacts, send_sms
 use crate::app::{handle_owner_text, AppError, OwnerTextOutcome, TelegramSink};
 use crate::config::Config;
 use crate::db::{Contact, Db, Topic};
-use crate::modem::SmsModem;
+use crate::modem::{CallForward, SmsModem};
 use crate::route::GENERAL_THREAD;
 
 use super::keyboards::{
@@ -323,12 +323,21 @@ async fn post_status(
     thread_id: i32,
     db: &Db,
     info: &dyn crate::modem::ModemInfo,
+    forward: &dyn CallForward,
     cfg: &Config,
     edit: Option<MessageId>,
 ) -> Result<(), AppError> {
     let html =
-        match crate::status::gather(info, db, cfg.status_tz, &cfg.modem_uid, chrono::Utc::now())
-            .await
+        match crate::status::gather(
+            info,
+            forward,
+            &cfg.default_region,
+            db,
+            cfg.status_tz,
+            &cfg.modem_uid,
+            chrono::Utc::now(),
+        )
+        .await
         {
             Ok(snap) => crate::status::format_status_html(&snap),
             Err(err) => {
@@ -421,6 +430,7 @@ async fn on_owner_dm(
     cfg: Config,
     db: Arc<Db>,
     info: Arc<dyn crate::modem::ModemInfo>,
+    forward: Arc<dyn CallForward>,
 ) -> Result<(), AppError> {
     if parse_cmd_name(msg.text().unwrap_or("")) == Some("status") {
         return post_status(
@@ -429,6 +439,7 @@ async fn on_owner_dm(
             crate::route::GENERAL_THREAD,
             &db,
             info.as_ref(),
+            forward.as_ref(),
             &cfg,
             None,
         )
@@ -457,6 +468,7 @@ async fn on_message(
     db: Arc<Db>,
     modem: Arc<dyn SmsModem>,
     info: Arc<dyn crate::modem::ModemInfo>,
+    forward: Arc<dyn CallForward>,
 ) -> Result<(), AppError> {
     let Some(text) = msg.text() else {
         return Ok(());
@@ -515,7 +527,17 @@ async fn on_message(
             }
         }
         Some("status") => {
-            post_status(&bot, tg.chat_id, thread_id, &db, info.as_ref(), &cfg, None).await?;
+            post_status(
+                &bot,
+                tg.chat_id,
+                thread_id,
+                &db,
+                info.as_ref(),
+                forward.as_ref(),
+                &cfg,
+                None,
+            )
+            .await?;
         }
         Some(_) => {}
         None if thread_id != GENERAL_THREAD => {
@@ -549,6 +571,7 @@ async fn on_callback(
     db: Arc<Db>,
     modem: Arc<dyn SmsModem>,
     info: Arc<dyn crate::modem::ModemInfo>,
+    forward: Arc<dyn CallForward>,
 ) -> Result<(), AppError> {
     let _ = bot.answer_callback_query(q.id.clone()).await;
     let Some(data) = q.data.as_deref() else {
@@ -571,7 +594,17 @@ async fn on_callback(
     if parse_status_refresh(data) {
         let chat_id = q.chat_id().unwrap_or(tg.chat_id);
         let msg_id = q.regular_message().map(|m| m.id);
-        return post_status(&bot, chat_id, thread_id, &db, info.as_ref(), &cfg, msg_id).await;
+        return post_status(
+            &bot,
+            chat_id,
+            thread_id,
+            &db,
+            info.as_ref(),
+            forward.as_ref(),
+            &cfg,
+            msg_id,
+        )
+        .await;
     }
     if let Some(e164) = parse_num_callback(data) {
         handle_num_callback(
@@ -618,11 +651,12 @@ pub async fn dispatch(
     db: Arc<Db>,
     modem: Arc<dyn SmsModem>,
     info: Arc<dyn crate::modem::ModemInfo>,
+    forward: Arc<dyn CallForward>,
 ) {
     let bot = Bot::new(cfg.telegram_bot_token.clone());
     register_commands(&bot, cfg.telegram_group_id).await;
     Dispatcher::builder(bot, schema())
-        .dependencies(dptree::deps![cfg, db, modem, info])
+        .dependencies(dptree::deps![cfg, db, modem, info, forward])
         .error_handler(LoggingErrorHandler::with_custom_text(
             "telegram handler error",
         ))

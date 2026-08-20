@@ -13,8 +13,8 @@ use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::Connection;
 
 use crate::modem::{
-    radio_from_access_tech, sim_status, IncomingSms, ModemError, ModemInfo, ModemLive, ModemState,
-    Registration, SmsInbox, SmsModem,
+    radio_from_access_tech, sim_status, CallForward, IncomingSms, ModemError, ModemInfo, ModemLive,
+    ModemState, Registration, SmsInbox, SmsModem,
 };
 
 const MM_DEST: &str = "org.freedesktop.ModemManager1";
@@ -542,6 +542,31 @@ impl ModemInfo for MmModem {
             }
         })
         .await
+    }
+}
+
+#[async_trait::async_trait]
+impl CallForward for MmModem {
+    async fn query_forward(
+        &self,
+        _default_region: &str,
+    ) -> Result<crate::call_forward::CallForwardState, ModemError> {
+        Err(ModemError::Failed("call forward not implemented".into()))
+    }
+
+    async fn set_forward(
+        &self,
+        _e164: &str,
+        _default_region: &str,
+    ) -> Result<crate::call_forward::CallForwardState, ModemError> {
+        Err(ModemError::Failed("call forward not implemented".into()))
+    }
+
+    async fn disable_forward(
+        &self,
+        _default_region: &str,
+    ) -> Result<crate::call_forward::CallForwardState, ModemError> {
+        Err(ModemError::Failed("call forward not implemented".into()))
     }
 }
 

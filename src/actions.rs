@@ -773,12 +773,22 @@ fn map_forward_err(err: crate::modem::ModemError) -> ActionError {
 
 pub async fn status(
     modem: &dyn crate::modem::ModemInfo,
+    forward: &dyn crate::modem::CallForward,
+    region: &str,
     db: &Db,
     tz: chrono_tz::Tz,
     modem_uid: &str,
 ) -> Result<serde_json::Value, ActionError> {
-    let snap =
-        crate::status::gather(modem, db, tz, modem_uid, chrono::Utc::now()).await?;
+    let snap = crate::status::gather(
+        modem,
+        forward,
+        region,
+        db,
+        tz,
+        modem_uid,
+        chrono::Utc::now(),
+    )
+    .await?;
     Ok(serde_json::to_value(crate::status::status_json_from_snapshot(&snap))
         .expect("StatusJson serializes"))
 }
@@ -1452,12 +1462,13 @@ mod tests {
     async fn status_offline_json() {
         let db = Db::open_in_memory().unwrap();
         let modem = crate::modem::FakeModem::default();
-        let v = status(&modem, &db, chrono_tz::UTC, "dwm222")
+        let v = status(&modem, &modem, "IR", &db, chrono_tz::UTC, "dwm222")
             .await
             .unwrap();
         assert_eq!(v["modem"]["state"], "offline");
         assert_eq!(v["modem_uid"], "dwm222");
         assert_eq!(v["contacts_ok"], true);
+        assert!(v.get("forward").is_none());
     }
 
     #[tokio::test]

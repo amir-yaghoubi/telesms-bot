@@ -10,6 +10,12 @@ pub enum ModemView {
     Live(ModemLive),
 }
 
+pub enum ForwardView {
+    Off,
+    On { label: String },
+    Unavailable,
+}
+
 pub struct LastSms {
     pub label: String,
     pub when: String,
@@ -134,6 +140,7 @@ pub fn status_json_from_snapshot(snap: &StatusSnapshot) -> StatusJson<'_> {
 pub struct StatusSnapshot {
     pub modem_uid: String,
     pub modem: ModemView,
+    pub forward: ForwardView,
     pub today_in: u32,
     pub today_out_ok: u32,
     pub today_out_fail: u32,
@@ -269,6 +276,14 @@ fn format_modem_section(snap: &StatusSnapshot) -> String {
     }
 }
 
+fn format_forward_line(view: &ForwardView) -> String {
+    match view {
+        ForwardView::Off => "↪️ Forward · off".into(),
+        ForwardView::On { label } => format!("↪️ Forward · {}", html_escape(label)),
+        ForwardView::Unavailable => "↪️ Forward · unavailable".into(),
+    }
+}
+
 pub fn today_start_rfc3339(now: chrono::DateTime<chrono::Utc>, tz: chrono_tz::Tz) -> String {
     let local = now.with_timezone(&tz);
     let midnight = local
@@ -283,6 +298,8 @@ pub fn today_start_rfc3339(now: chrono::DateTime<chrono::Utc>, tz: chrono_tz::Tz
 
 pub async fn gather(
     modem: &dyn ModemInfo,
+    forward: &dyn crate::modem::CallForward,
+    region: &str,
     db: &Db,
     tz: chrono_tz::Tz,
     modem_uid: &str,
@@ -304,9 +321,25 @@ pub async fn gather(
     } else {
         None
     };
+    let forward_view = match forward.query_forward(region).await {
+        Ok(st) if !st.enabled => ForwardView::Off,
+        Ok(st) => {
+            let e164 = st.e164.unwrap_or_default();
+            let label = db
+                .find_contact_by_e164(&e164)?
+                .map(|c| c.display_name)
+                .unwrap_or(e164);
+            ForwardView::On { label }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "status call forward query");
+            ForwardView::Unavailable
+        }
+    };
     Ok(StatusSnapshot {
         modem_uid: modem_uid.to_string(),
         modem: modem_view,
+        forward: forward_view,
         today_in: counts.inbound,
         today_out_ok: counts.sent_ok,
         today_out_fail: counts.sent_fail,
@@ -338,6 +371,8 @@ fn map_last(
 
 pub fn format_status_html(snap: &StatusSnapshot) -> String {
     let mut out = format_modem_section(snap);
+    out.push('\n');
+    out.push_str(&format_forward_line(&snap.forward));
     out.push_str("\n\n");
 
     out.push_str("<b>Today</b>\n");
@@ -407,6 +442,7 @@ mod tests {
         StatusSnapshot {
             modem_uid: "dwm222".into(),
             modem: ModemView::Live(live_ok()),
+            forward: ForwardView::Off,
             today_in: 4,
             today_out_ok: 2,
             today_out_fail: 0,
@@ -432,6 +468,7 @@ mod tests {
 🟢 Registered · MTN Irancell · home\n\
 📶 Fair (38%) · 3G · -93 dBm\n\
 SIM ok\n\
+↪️ Forward · off\n\
 \n\
 <b>Today</b>\n\
 ↓ 4 received\n\
@@ -444,6 +481,23 @@ SIM ok\n\
 \n\
 Contacts · OK"
         );
+    }
+
+    #[test]
+    fn forward_on_html() {
+        let mut s = happy();
+        s.forward = ForwardView::On {
+            label: "Ali".into(),
+        };
+        let html = format_status_html(&s);
+        assert!(html.contains("↪️ Forward · Ali"));
+    }
+
+    #[test]
+    fn forward_unavailable_html() {
+        let mut s = happy();
+        s.forward = ForwardView::Unavailable;
+        assert!(format_status_html(&s).contains("↪️ Forward · unavailable"));
     }
 
     #[test]
@@ -482,6 +536,7 @@ Contacts · OK"
                 access_tech: None,
                 sim: SimStatus::Ok,
             }),
+            forward: ForwardView::Off,
             today_in: 0,
             today_out_ok: 0,
             today_out_fail: 0,
@@ -585,7 +640,15 @@ Contacts · OK"
             .unwrap();
         let modem = crate::modem::FakeModem::default(); // live None → NotFound
         let now = Utc.with_ymd_and_hms(2026, 8, 19, 11, 0, 0).unwrap();
-        let snap = gather(&modem, &db, chrono_tz::Asia::Tehran, "dwm222", now)
+        let snap = gather(
+            &modem,
+            &modem,
+            "IR",
+            &db,
+            chrono_tz::Asia::Tehran,
+            "dwm222",
+            now,
+        )
             .await
             .unwrap();
         assert!(matches!(snap.modem, ModemView::Offline));
@@ -599,7 +662,15 @@ Contacts · OK"
         let modem = crate::modem::FakeModem::default();
         *modem.live.lock().unwrap() = Some(live_ok());
         let now = Utc.with_ymd_and_hms(2026, 8, 19, 11, 0, 0).unwrap();
-        let snap = gather(&modem, &db, chrono_tz::UTC, "dwm222", now)
+        let snap = gather(
+            &modem,
+            &modem,
+            "IR",
+            &db,
+            chrono_tz::UTC,
+            "dwm222",
+            now,
+        )
             .await
             .unwrap();
         match snap.modem {
@@ -607,5 +678,29 @@ Contacts · OK"
             ModemView::Offline => panic!("expected live"),
         }
         assert!(snap.contacts_ok);
+    }
+
+    #[tokio::test]
+    async fn gather_soft_fails_forward() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let modem = crate::modem::FakeModem::default();
+        *modem.live.lock().unwrap() = Some(live_ok());
+        let forward = crate::modem::FakeModem {
+            forward_fail: true,
+            ..Default::default()
+        };
+        let now = Utc.with_ymd_and_hms(2026, 8, 19, 11, 0, 0).unwrap();
+        let snap = gather(
+            &modem,
+            &forward,
+            "IR",
+            &db,
+            chrono_tz::UTC,
+            "dwm222",
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(snap.forward, ForwardView::Unavailable));
     }
 }
