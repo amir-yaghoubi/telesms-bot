@@ -111,6 +111,19 @@ pub struct TodaySmsCounts {
     pub sent_fail: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PendingForwardMode {
+    Search,
+    Number,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingForward {
+    pub mode: PendingForwardMode,
+    pub edit_chat_id: i64,
+    pub edit_message_id: i32,
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Self, DbError> {
         let conn = Connection::open(path)?;
@@ -132,6 +145,14 @@ impl Db {
         let _ = conn.execute("ALTER TABLE inbound_log ADD COLUMN sms_ts TEXT", []);
         let _ = conn.execute("ALTER TABLE inbound_log ADD COLUMN thread_id INTEGER", []);
         let _ = conn.execute("ALTER TABLE outbound_log ADD COLUMN thread_id INTEGER", []);
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS pending_forward (
+                thread_id INTEGER PRIMARY KEY,
+                mode TEXT NOT NULL,
+                edit_chat_id INTEGER NOT NULL,
+                edit_message_id INTEGER NOT NULL
+             );",
+        )?;
         let db = Db {
             conn: Mutex::new(conn),
             contacts_available: AtomicBool::new(true),
@@ -347,6 +368,87 @@ impl Db {
             rusqlite::params![thread_id],
         )?;
         Ok(row.and_then(|(text, reply_to)| text.map(|t| (t, reply_to))))
+    }
+
+    fn pending_forward_mode_str(mode: PendingForwardMode) -> &'static str {
+        match mode {
+            PendingForwardMode::Search => "search",
+            PendingForwardMode::Number => "number",
+        }
+    }
+
+    fn pending_forward_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingForward> {
+        let mode: String = row.get(0)?;
+        let mode = match mode.as_str() {
+            "search" => PendingForwardMode::Search,
+            "number" => PendingForwardMode::Number,
+            other => {
+                return Err(rusqlite::Error::InvalidColumnType(
+                    0,
+                    other.to_string(),
+                    rusqlite::types::Type::Text,
+                ));
+            }
+        };
+        Ok(PendingForward {
+            mode,
+            edit_chat_id: row.get(1)?,
+            edit_message_id: row.get(2)?,
+        })
+    }
+
+    pub fn set_pending_forward(
+        &self,
+        thread_id: i32,
+        mode: PendingForwardMode,
+        edit_chat_id: i64,
+        edit_message_id: i32,
+    ) -> Result<(), DbError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO pending_forward (thread_id, mode, edit_chat_id, edit_message_id)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(thread_id) DO UPDATE SET
+               mode = excluded.mode,
+               edit_chat_id = excluded.edit_chat_id,
+               edit_message_id = excluded.edit_message_id",
+            rusqlite::params![
+                thread_id,
+                Self::pending_forward_mode_str(mode),
+                edit_chat_id,
+                edit_message_id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_pending_forward(&self, thread_id: i32) -> Result<Option<PendingForward>, DbError> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT mode, edit_chat_id, edit_message_id
+             FROM pending_forward WHERE thread_id = ?1",
+            rusqlite::params![thread_id],
+            Self::pending_forward_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn take_pending_forward(&self, thread_id: i32) -> Result<Option<PendingForward>, DbError> {
+        let pending = self.get_pending_forward(thread_id)?;
+        if pending.is_some() {
+            self.clear_pending_forward(thread_id)?;
+        }
+        Ok(pending)
+    }
+
+    pub fn clear_pending_forward(&self, thread_id: i32) -> Result<(), DbError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "DELETE FROM pending_forward WHERE thread_id = ?1",
+            rusqlite::params![thread_id],
+        )?;
+        Ok(())
     }
 
     pub fn set_default_number(&self, thread_id: i32, e164: &str) -> Result<(), DbError> {
@@ -1081,6 +1183,19 @@ mod tests {
         assert!(msgs
             .iter()
             .any(|m| m.direction == "out" && m.status == "failed" && m.id.starts_with("out:")));
+    }
+
+    #[test]
+    fn pending_forward_roundtrip() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_pending_forward(1, PendingForwardMode::Number, 99, 7)
+            .unwrap();
+        let p = db.get_pending_forward(1).unwrap().unwrap();
+        assert!(matches!(p.mode, PendingForwardMode::Number));
+        assert_eq!(p.edit_message_id, 7);
+        let taken = db.take_pending_forward(1).unwrap().unwrap();
+        assert!(db.get_pending_forward(1).unwrap().is_none());
+        assert_eq!(taken.edit_chat_id, 99);
     }
 
     #[test]
