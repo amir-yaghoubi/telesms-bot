@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use axum::body::Body;
+use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{FromRequest, Path, Query, Request, State};
-use axum::extract::rejection::JsonRejection;
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -493,8 +493,18 @@ struct HistoryQuery {
 
 async fn chats_handler(
     State(state): State<HttpState>,
-    Query(q): Query<HistoryQuery>,
+    query: Result<Query<HistoryQuery>, QueryRejection>,
 ) -> Response {
+    let Query(q) = match query {
+        Ok(query) => query,
+        Err(rejection) => {
+            return api_error_response(
+                StatusCode::BAD_REQUEST,
+                "validation",
+                &rejection.to_string(),
+            );
+        }
+    };
     match actions::list_chats(
         state.db.as_ref(),
         q.limit,
@@ -508,9 +518,29 @@ async fn chats_handler(
 
 async fn chat_messages_handler(
     State(state): State<HttpState>,
-    Path(thread_id): Path<i32>,
-    Query(q): Query<HistoryQuery>,
+    path: Result<Path<i32>, PathRejection>,
+    query: Result<Query<HistoryQuery>, QueryRejection>,
 ) -> Response {
+    let Path(thread_id) = match path {
+        Ok(path) => path,
+        Err(rejection) => {
+            return api_error_response(
+                StatusCode::BAD_REQUEST,
+                "validation",
+                &rejection.to_string(),
+            );
+        }
+    };
+    let Query(q) = match query {
+        Ok(query) => query,
+        Err(rejection) => {
+            return api_error_response(
+                StatusCode::BAD_REQUEST,
+                "validation",
+                &rejection.to_string(),
+            );
+        }
+    };
     match actions::list_messages(
         state.db.as_ref(),
         &state.cfg.default_region,
@@ -823,6 +853,46 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let v = body_json(res).await;
         assert_eq!(v["chats"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn invalid_history_limit_returns_validation_envelope() {
+        let app = test_router("secret");
+        let res = call(
+            app,
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/api/v1/chats?limit=abc")
+                .header("X-Api-Key", "secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let v = body_json(res).await;
+        assert_eq!(v["error"], "validation");
+        assert!(v["message"].is_string());
+    }
+
+    #[tokio::test]
+    async fn invalid_history_path_returns_validation_envelope() {
+        let app = test_router("secret");
+        let res = call(
+            app,
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/api/v1/chats/abc/messages")
+                .header("X-Api-Key", "secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let v = body_json(res).await;
+        assert_eq!(v["error"], "validation");
+        assert!(v["message"].is_string());
     }
 
     #[tokio::test]

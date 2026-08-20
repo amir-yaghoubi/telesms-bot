@@ -220,9 +220,9 @@ fn parse_history_cursor(raw: Option<&str>) -> Result<Option<String>, ActionError
     let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
     };
-    chrono::DateTime::parse_from_rfc3339(raw)
+    let parsed = chrono::DateTime::parse_from_rfc3339(raw)
         .map_err(|_| ActionError::Validation("invalid cursor timestamp".into()))?;
-    Ok(Some(raw.to_string()))
+    Ok(Some(parsed.with_timezone(&chrono::Utc).to_rfc3339()))
 }
 
 fn history_cursors(
@@ -788,6 +788,57 @@ mod tests {
         assert_eq!(out.chats.len(), 1);
         assert_eq!(out.next_before.as_deref(), Some("2026-08-20T08:00:00Z"));
         assert!(out.chats[0].unread_count.is_none());
+    }
+
+    #[test]
+    fn list_chats_offset_cursor_matches_utc_equivalent() {
+        let db = Db::open_in_memory().unwrap();
+        for (thread_id, e164, title) in
+            [(41, "+98912", "Before"), (42, "+98913", "After")]
+        {
+            db.upsert_topic(&Topic {
+                thread_id,
+                contact_id: None,
+                default_e164: Some(e164.into()),
+                title: title.into(),
+                ignored: false,
+            })
+            .unwrap();
+        }
+        db.insert_inbound_at(
+            "/before",
+            "+98912",
+            "before",
+            "2026-08-20T08:30:00Z",
+            Some(41),
+        )
+        .unwrap();
+        db.insert_inbound_at(
+            "/after",
+            "+98913",
+            "after",
+            "2026-08-20T09:30:00Z",
+            Some(42),
+        )
+        .unwrap();
+
+        let utc = list_chats(&db, None, Some("2026-08-20T09:00:00Z"), None).unwrap();
+        let offset =
+            list_chats(&db, None, Some("2026-08-20T12:30:00+03:30"), None).unwrap();
+
+        assert_eq!(offset.chats.len(), utc.chats.len());
+        assert_eq!(
+            offset
+                .chats
+                .iter()
+                .map(|chat| chat.last_message_preview.as_str())
+                .collect::<Vec<_>>(),
+            utc.chats
+                .iter()
+                .map(|chat| chat.last_message_preview.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(utc.chats[0].last_message_preview, "before");
     }
 
     #[test]
