@@ -13,7 +13,8 @@ use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::Connection;
 
 use crate::call_forward::{
-    parse_ussd_reply, ussd_disable, ussd_enable, ussd_query, CallForwardState,
+    ccfc_disable, ccfc_enable, ccfc_query, parse_ccfc_reply, parse_ussd_reply, ussd_disable,
+    ussd_enable, ussd_query, CallForwardState,
 };
 use crate::modem::{
     radio_from_access_tech, sim_status, CallForward, IncomingSms, ModemError, ModemInfo, ModemLive,
@@ -25,6 +26,7 @@ const MM_DEST: &str = "org.freedesktop.ModemManager1";
 const MM_PATH: &str = "/org/freedesktop/ModemManager1";
 const MM_MODEM_IFACE: &str = "org.freedesktop.ModemManager1.Modem";
 const USSD_TIMEOUT: Duration = Duration::from_secs(45);
+const AT_TIMEOUT_SECS: u32 = 30;
 
 /// PDU type 2 is submit (outbound). Deliver is 1.
 pub fn sms_is_inbound(pdu_type: u32) -> bool {
@@ -37,6 +39,18 @@ fn mm_err(err: impl std::fmt::Display) -> ModemError {
 
 fn apply_ussd_reply(reply: Result<String, ModemError>) -> Result<(), ModemError> {
     reply.map(|_| ())
+}
+
+fn apply_at_reply(reply: &str) -> Result<(), ModemError> {
+    let upper = reply.to_ascii_uppercase();
+    if upper.contains("+CME ERROR")
+        || upper
+            .lines()
+            .any(|line| matches!(line.trim(), "ERROR" | "NO CARRIER"))
+    {
+        return Err(ModemError::Failed(format!("AT command failed: {reply}")));
+    }
+    Ok(())
 }
 
 pub fn delete_already_gone_name(name: &str) -> bool {
@@ -97,6 +111,8 @@ trait Sms {
     default_service = "org.freedesktop.ModemManager1"
 )]
 trait ModemDevice {
+    fn command(&self, cmd: &str, timeout: u32) -> zbus::Result<String>;
+
     #[zbus(property)]
     fn state(&self) -> zbus::Result<i32>;
     #[zbus(property)]
@@ -421,6 +437,58 @@ impl MmModem {
         let reply = self.ussd_initiate(command).await?;
         parse_ussd_reply(&reply, default_region).map_err(ModemError::Failed)
     }
+
+    async fn at_command(&self, command: &str) -> Result<String, ModemError> {
+        self.with_modem_path(|modem_path| {
+            let conn = self.conn.clone();
+            let command = command.to_string();
+            async move {
+                let modem = ModemDeviceProxy::builder(&conn)
+                    .path(&modem_path)
+                    .map_err(mm_err)?
+                    .build()
+                    .await
+                    .map_err(mm_err)?;
+                let reply = tokio::time::timeout(
+                    Duration::from_secs(AT_TIMEOUT_SECS as u64 + 5),
+                    modem.command(&command, AT_TIMEOUT_SECS),
+                )
+                .await
+                .map_err(|_| ModemError::Failed("AT command timeout".into()))?
+                .map_err(mm_err)?;
+                Ok(reply)
+            }
+        })
+        .await
+    }
+
+    async fn ccfc_roundtrip(
+        &self,
+        command: &str,
+        default_region: &str,
+    ) -> Result<CallForwardState, ModemError> {
+        let reply = self.at_command(command).await?;
+        apply_at_reply(&reply)?;
+        parse_ccfc_reply(&reply, default_region).map_err(ModemError::Failed)
+    }
+
+    async fn query_forward_prefer_at(
+        &self,
+        default_region: &str,
+    ) -> Result<CallForwardState, ModemError> {
+        match self.ccfc_roundtrip(ccfc_query(), default_region).await {
+            Ok(state) => Ok(state),
+            Err(at_err) => {
+                tracing::warn!(error = %at_err, "AT+CCFC query failed; trying USSD");
+                match self.ussd_roundtrip(ussd_query(), default_region).await {
+                    Ok(state) => Ok(state),
+                    Err(ussd_err) => Err(ModemError::Failed(format!(
+                        "call forward query failed (AT: {at_err}; USSD: {ussd_err})"
+                    ))),
+                }
+            }
+        }
+    }
 }
 
 async fn load_incoming_sms(
@@ -620,7 +688,7 @@ impl ModemInfo for MmModem {
 impl CallForward for MmModem {
     async fn query_forward(&self, default_region: &str) -> Result<CallForwardState, ModemError> {
         let _guard = self.call_forward_lock.lock().await;
-        self.ussd_roundtrip(ussd_query(), default_region).await
+        self.query_forward_prefer_at(default_region).await
     }
 
     async fn set_forward(
@@ -631,9 +699,28 @@ impl CallForward for MmModem {
         let _guard = self.call_forward_lock.lock().await;
         let e164 = normalize_e164(e164, default_region)
             .map_err(|err| ModemError::Failed(err.to_string()))?;
-        apply_ussd_reply(self.ussd_initiate(&ussd_enable(&e164)).await)?;
 
-        match self.ussd_roundtrip(ussd_query(), default_region).await {
+        let at_apply = async {
+            let reply = self.at_command(&ccfc_enable(&e164)).await?;
+            apply_at_reply(&reply)
+        }
+        .await;
+
+        match at_apply {
+            Ok(()) => {}
+            Err(at_err) => {
+                tracing::warn!(error = %at_err, "AT+CCFC enable failed; trying USSD");
+                apply_ussd_reply(self.ussd_initiate(&ussd_enable(&e164)).await).map_err(
+                    |ussd_err| {
+                        ModemError::Failed(format!(
+                            "call forward set failed (AT: {at_err}; USSD: {ussd_err})"
+                        ))
+                    },
+                )?;
+            }
+        }
+
+        match self.query_forward_prefer_at(default_region).await {
             Ok(state) => Ok(state),
             Err(_) => Ok(CallForwardState {
                 enabled: true,
@@ -644,9 +731,26 @@ impl CallForward for MmModem {
 
     async fn disable_forward(&self, default_region: &str) -> Result<CallForwardState, ModemError> {
         let _guard = self.call_forward_lock.lock().await;
-        apply_ussd_reply(self.ussd_initiate(ussd_disable()).await)?;
 
-        match self.ussd_roundtrip(ussd_query(), default_region).await {
+        let at_apply = async {
+            let reply = self.at_command(ccfc_disable()).await?;
+            apply_at_reply(&reply)
+        }
+        .await;
+
+        match at_apply {
+            Ok(()) => {}
+            Err(at_err) => {
+                tracing::warn!(error = %at_err, "AT+CCFC disable failed; trying USSD");
+                apply_ussd_reply(self.ussd_initiate(ussd_disable()).await).map_err(|ussd_err| {
+                    ModemError::Failed(format!(
+                        "call forward disable failed (AT: {at_err}; USSD: {ussd_err})"
+                    ))
+                })?;
+            }
+        }
+
+        match self.query_forward_prefer_at(default_region).await {
             Ok(state) => Ok(state),
             Err(_) => Ok(CallForwardState {
                 enabled: false,
@@ -685,6 +789,14 @@ mod tests {
         assert!(!sms_text_ready(""));
         assert!(sms_text_ready("hi"));
         assert!(sms_text_ready("سلام\nline"));
+    }
+
+    #[test]
+    fn apply_at_reply_rejects_error() {
+        assert!(apply_at_reply("OK\r\n").is_ok());
+        assert!(apply_at_reply("+CCFC: 0,7\r\nOK\r\n").is_ok());
+        assert!(apply_at_reply("ERROR\r\n").is_err());
+        assert!(apply_at_reply("+CME ERROR: 4\r\n").is_err());
     }
 
     #[test]
