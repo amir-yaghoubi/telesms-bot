@@ -113,7 +113,7 @@ async fn sms_known_contact_creates_topic_sends_and_acks() {
 async fn who_in_general_says_so() {
     let db = Db::open_in_memory().unwrap();
     let tg = FakeTg::new();
-    handle_who(&db, 1, &tg).await.unwrap();
+    handle_who(&db, "IR", 1, &tg).await.unwrap();
     assert_eq!(
         tg.posts.lock().unwrap().as_slice(),
         &[(1, "this is General".into())]
@@ -135,7 +135,7 @@ async fn who_in_contact_topic_lists_numbers() {
     })
     .unwrap();
     let tg = FakeTg::new();
-    handle_who(&db, 9, &tg).await.unwrap();
+    handle_who(&db, "IR", 9, &tg).await.unwrap();
     let posts = tg.posts.lock().unwrap();
     assert!(posts[0].1.contains("Ali"));
     assert!(posts[0].1.contains("+98912 (default)"));

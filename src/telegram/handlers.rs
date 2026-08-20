@@ -6,6 +6,7 @@ use teloxide::error_handlers::LoggingErrorHandler;
 use teloxide::prelude::*;
 use teloxide::types::{BotCommandScope, CallbackQuery, ChatId, InlineQuery, MessageId, ParseMode};
 
+use crate::actions::{search_contacts, who, ActionError, Identity};
 use crate::app::{handle_owner_text, send_and_ack, AppError, OwnerTextOutcome, TelegramSink};
 use crate::config::Config;
 use crate::db::{Contact, Db, Topic};
@@ -50,6 +51,7 @@ fn topic_numbers(db: &Db, topic: &Topic) -> Result<Vec<String>, AppError> {
 
 pub(crate) async fn handle_who(
     db: &Db,
+    region: &str,
     thread_id: i32,
     tg: &dyn TelegramSink,
 ) -> Result<(), AppError> {
@@ -61,19 +63,38 @@ pub(crate) async fn handle_who(
         tg.post(thread_id, "unknown topic".to_string()).await?;
         return Ok(());
     };
-    let numbers = topic_numbers(db, &topic)?;
-    let contact = numbers
-        .first()
-        .map(|n| db.find_contact_by_e164(n))
-        .transpose()?
-        .flatten();
-    let name = contact.as_ref().map(|c| c.display_name.as_str());
-    let mut text = format_who(&topic, name, &numbers);
-    if contact.is_some_and(|c| c.ambiguous) {
-        text.push_str("\n(also on another contact)");
+    if topic.contact_id.is_none() && topic.default_e164.is_none() {
+        tg.post(thread_id, "unknown topic".to_string()).await?;
+        return Ok(());
     }
-    tg.post(thread_id, text).await?;
-    Ok(())
+    let identity = Identity {
+        contact_id: topic.contact_id,
+        number: topic.default_e164.clone(),
+        thread_id: Some(thread_id),
+    };
+    match who(db, region, &identity) {
+        Ok(w) => {
+            let topic = Topic {
+                thread_id: w.thread_id,
+                contact_id: w.contact_id,
+                default_e164: w.default_e164.clone(),
+                title: w.display_name.clone(),
+                ignored: false,
+            };
+            let mut text = format_who(&topic, Some(&w.display_name), &w.numbers);
+            if w.ambiguous {
+                text.push_str("\n(also on another contact)");
+            }
+            tg.post(thread_id, text).await?;
+            Ok(())
+        }
+        Err(ActionError::NotFound(_)) => {
+            tg.post(thread_id, "unknown topic".to_string()).await?;
+            Ok(())
+        }
+        Err(ActionError::Db(e)) => Err(e.into()),
+        Err(e) => Err(AppError::Telegram(e.to_string())),
+    }
 }
 
 pub(crate) async fn handle_number_empty_or_list(
@@ -147,17 +168,24 @@ pub(crate) async fn handle_search(
             .await?;
         return Ok(Vec::new());
     }
-    match db.search_contacts(query) {
+    match search_contacts(db, query) {
         Ok(hits) if hits.is_empty() => {
             tg.post(thread_id, "no matches".to_string()).await?;
             Ok(hits)
         }
         Ok(hits) => Ok(hits),
-        Err(_) => {
+        Err(ActionError::Validation(_)) => {
+            tg.post(thread_id, "usage: /search <query>".to_string())
+                .await?;
+            Ok(Vec::new())
+        }
+        Err(ActionError::ContactsUnavailable) => {
             tg.post(thread_id, "contacts unavailable".to_string())
                 .await?;
             Ok(Vec::new())
         }
+        Err(ActionError::Db(e)) => Err(e.into()),
+        Err(e) => Err(AppError::Telegram(e.to_string())),
     }
 }
 
@@ -473,7 +501,7 @@ async fn on_message(
     }
     match parse_cmd_name(text) {
         Some("help") => handle_help(thread_id, &tg).await?,
-        Some("who") => handle_who(&db, thread_id, &tg).await?,
+        Some("who") => handle_who(&db, &cfg.default_region, thread_id, &tg).await?,
         Some("number") => {
             let numbers = handle_number_empty_or_list(&db, thread_id, &tg).await?;
             if !numbers.is_empty() {

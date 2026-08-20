@@ -168,6 +168,58 @@ pub fn resolve(
     })
 }
 
+pub const SEARCH_LIMIT: usize = 20;
+
+pub fn search_contacts(db: &Db, query: &str) -> Result<Vec<Contact>, ActionError> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err(ActionError::Validation("query required".into()));
+    }
+    match db.search_contacts(query) {
+        Ok(mut hits) => {
+            hits.truncate(SEARCH_LIMIT);
+            Ok(hits)
+        }
+        Err(crate::db::DbError::ContactsUnavailable) => Err(ActionError::ContactsUnavailable),
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Who {
+    pub thread_id: i32,
+    pub contact_id: Option<i64>,
+    pub display_name: String,
+    pub numbers: Vec<String>,
+    pub default_e164: Option<String>,
+    pub ambiguous: bool,
+}
+
+pub fn who(db: &Db, region: &str, id: &Identity) -> Result<Who, ActionError> {
+    let resolved = resolve(db, region, id, ResolveMode::RequireTopic)?;
+    let topic = resolved
+        .topic
+        .as_ref()
+        .ok_or_else(|| ActionError::NotFound("unknown topic".into()))?;
+    let numbers = if let Some(contact_id) = topic.contact_id {
+        db.contact_numbers(contact_id)?
+    } else {
+        topic.default_e164.clone().into_iter().collect()
+    };
+    let (display_name, ambiguous) = match resolved.contact {
+        Some(ref c) => (c.display_name.clone(), c.ambiguous),
+        None => (topic.title.clone(), false),
+    };
+    Ok(Who {
+        thread_id: topic.thread_id,
+        contact_id: topic.contact_id,
+        display_name,
+        numbers,
+        default_e164: topic.default_e164.clone(),
+        ambiguous,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,5 +378,51 @@ mod tests {
         assert!(r.contact.is_none());
         assert!(r.topic.is_none());
         assert!(r.e164.unwrap().starts_with('+'));
+    }
+
+    #[test]
+    fn search_empty_query() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(matches!(
+            search_contacts(&db, "  ").unwrap_err(),
+            ActionError::Validation(_)
+        ));
+    }
+
+    #[test]
+    fn search_returns_hit_and_caps() {
+        let db = Db::open_in_memory().unwrap();
+        for i in 0..25 {
+            db.upsert_contact(&format!("people/{i}"), "Ali").unwrap();
+        }
+        let hits = search_contacts(&db, "Ali").unwrap();
+        assert_eq!(hits.len(), 20);
+    }
+
+    #[test]
+    fn search_unavailable() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_contacts_available(false);
+        assert!(matches!(
+            search_contacts(&db, "x").unwrap_err(),
+            ActionError::ContactsUnavailable
+        ));
+    }
+
+    #[test]
+    fn who_lists_default() {
+        let (db, id) = seed();
+        let w = who(
+            &db,
+            "IR",
+            &Identity {
+                contact_id: Some(id),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(w.thread_id, 9);
+        assert_eq!(w.default_e164.as_deref(), Some("+989121234567"));
+        assert!(w.numbers.contains(&"+989121234567".into()));
     }
 }
