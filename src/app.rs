@@ -93,35 +93,30 @@ pub async fn watch_inbox<I>(
         }
         match inbox.subscribe_added().await {
             Ok(stream) => {
-                match inbox.list_sms().await {
-                    Ok(existing) => {
-                        tracing::info!(n = existing.len(), "processing modem inbox");
-                        for sms in existing {
-                            if cancel.is_cancelled() {
-                                return;
-                            }
-                            if let Err(err) = handle_incoming_then_delete(
-                                &db,
-                                &region,
-                                sms,
-                                tg.as_ref(),
-                                inbox.as_ref(),
-                                delete_enabled,
-                            )
-                            .await
-                            {
-                                tracing::error!(error = %err, "existing sms");
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        tracing::warn!(error = %err, "list modem inbox failed");
-                    }
-                }
+                drain_listed_sms(
+                    inbox.as_ref(),
+                    db.as_ref(),
+                    &region,
+                    tg.as_ref(),
+                    delete_enabled,
+                    &cancel,
+                )
+                .await;
                 let mut stream = std::pin::pin!(stream);
                 loop {
                     tokio::select! {
                         _ = cancel.cancelled() => return,
+                        _ = tokio::time::sleep(retry) => {
+                            drain_listed_sms(
+                                inbox.as_ref(),
+                                db.as_ref(),
+                                &region,
+                                tg.as_ref(),
+                                delete_enabled,
+                                &cancel,
+                            )
+                            .await;
+                        }
                         sms = stream.next() => {
                             let Some(sms) = sms else {
                                 tracing::warn!("modem added signal stream ended");
@@ -221,6 +216,38 @@ impl TelegramSink for FakeTg {
     }
 }
 
+async fn drain_listed_sms<I>(
+    inbox: &I,
+    db: &Db,
+    region: &str,
+    tg: &dyn TelegramSink,
+    delete_enabled: bool,
+    cancel: &CancellationToken,
+) where
+    I: SmsInbox,
+{
+    match inbox.list_sms().await {
+        Ok(existing) => {
+            if !existing.is_empty() {
+                tracing::info!(n = existing.len(), "processing modem inbox");
+            }
+            for sms in existing {
+                if cancel.is_cancelled() {
+                    return;
+                }
+                if let Err(err) =
+                    handle_incoming_then_delete(db, region, sms, tg, inbox, delete_enabled).await
+                {
+                    tracing::error!(error = %err, "existing sms");
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "list modem inbox failed");
+        }
+    }
+}
+
 pub async fn maybe_delete(enabled: bool, modem: &dyn SmsModem, path: &str) {
     if !enabled || path.is_empty() {
         return;
@@ -238,6 +265,14 @@ pub async fn handle_incoming_then_delete(
     modem: &dyn SmsModem,
     delete_enabled: bool,
 ) -> Result<(), AppError> {
+    if sms.inbound && sms.text.is_empty() {
+        tracing::info!(
+            path = %sms.path,
+            e164 = %sms.e164,
+            "defer inbound sms until text is decoded"
+        );
+        return Ok(());
+    }
     let path = sms.path.clone();
     match handle_incoming(db, region, sms, tg).await {
         Ok(()) => {
@@ -728,10 +763,7 @@ mod tests {
             modem.deleted.lock().unwrap().as_slice(),
             &["/fake/sms/1".into()] as &[String]
         );
-        assert_eq!(
-            db.last_outbound_ok().unwrap().unwrap().0,
-            "+98912"
-        );
+        assert_eq!(db.last_outbound_ok().unwrap().unwrap().0, "+98912");
     }
 
     #[tokio::test]
@@ -823,11 +855,8 @@ mod tests {
     async fn owner_text_two_numbers_asks_and_saves_pending() {
         let db = Db::open_in_memory().unwrap();
         let id = db.upsert_contact("people/a", "Ali").unwrap();
-        db.replace_contact_numbers(
-            id,
-            &["+989188086139".into(), "+989025438263".into()],
-        )
-        .unwrap();
+        db.replace_contact_numbers(id, &["+989188086139".into(), "+989025438263".into()])
+            .unwrap();
         db.upsert_topic(&Topic {
             thread_id: 42,
             contact_id: Some(id),
@@ -843,10 +872,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             out,
-            OwnerTextOutcome::NeedNumber(vec![
-                "+989188086139".into(),
-                "+989025438263".into()
-            ])
+            OwnerTextOutcome::NeedNumber(vec!["+989188086139".into(), "+989025438263".into()])
         );
         assert!(modem.sent.lock().unwrap().is_empty());
         assert!(tg.posts.lock().unwrap().is_empty());
@@ -1087,6 +1113,37 @@ mod tests {
         .is_err());
         assert!(modem.deleted.lock().unwrap().is_empty());
         assert!(!db.seen_sms_path("/sms/1").unwrap());
+    }
+
+    #[tokio::test]
+    async fn incoming_empty_text_does_not_post_or_delete() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db.upsert_contact("people/a", "Ali").unwrap();
+        db.replace_contact_numbers(id, &["+989121234567".into()])
+            .unwrap();
+        db.upsert_topic(&Topic {
+            thread_id: 42,
+            contact_id: Some(id),
+            default_e164: Some("+989121234567".into()),
+            title: "Ali (4567)".into(),
+            ignored: false,
+        })
+        .unwrap();
+        let tg = FakeTg::new();
+        let modem = FakeModem::default();
+        let sms = IncomingSms {
+            path: "/sms/empty".into(),
+            e164: "09121234567".into(),
+            text: String::new(),
+            inbound: true,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+        handle_incoming_then_delete(&db, "IR", sms, &tg, &modem, true)
+            .await
+            .unwrap();
+        assert!(tg.posts.lock().unwrap().is_empty());
+        assert!(modem.deleted.lock().unwrap().is_empty());
+        assert!(!db.seen_sms_path("/sms/empty").unwrap());
     }
 
     #[tokio::test]
