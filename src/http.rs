@@ -42,6 +42,7 @@ pub fn router(state: HttpState) -> Router {
         .route("/who", post(who_handler))
         .route("/number", post(number_handler))
         .route("/ignore", post(ignore_handler))
+        .route("/call-forward", get(call_forward_get).put(call_forward_put))
         .route("/chats", get(chats_handler))
         .route("/chats/{thread_id}/messages", get(chat_messages_handler))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
@@ -331,6 +332,50 @@ async fn status_handler(State(state): State<HttpState>) -> Response {
     {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => action_to_response(e).into_response(),
+    }
+}
+
+async fn call_forward_get(State(state): State<HttpState>) -> Response {
+    match actions::get_call_forward(state.forward.as_ref(), &state.cfg.default_region).await {
+        Ok(st) => Json(json!({
+            "enabled": st.enabled,
+            "e164": st.e164,
+        }))
+        .into_response(),
+        Err(err) => action_to_response(err).into_response(),
+    }
+}
+
+async fn call_forward_put(
+    State(state): State<HttpState>,
+    ApiJson(body): ApiJson<Value>,
+) -> Response {
+    let Some(value) = body.get("e164") else {
+        return action_to_response(ActionError::Validation("e164 is required".into()))
+            .into_response();
+    };
+    let e164 = match value {
+        Value::Null => None,
+        Value::String(value) if value.trim().is_empty() => {
+            return action_to_response(ActionError::Validation("e164 must not be empty".into()))
+                .into_response();
+        }
+        Value::String(value) => Some(value.clone()),
+        _ => {
+            return action_to_response(ActionError::Validation(
+                "e164 must be string or null".into(),
+            ))
+            .into_response();
+        }
+    };
+
+    match actions::put_call_forward(state.forward.as_ref(), &state.cfg.default_region, e164).await {
+        Ok(st) => Json(json!({
+            "enabled": st.enabled,
+            "e164": st.e164,
+        }))
+        .into_response(),
+        Err(err) => action_to_response(err).into_response(),
     }
 }
 
@@ -722,6 +767,97 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        assert!(body.get("call_forward").is_none());
+        assert!(body.get("forward").is_none());
+    }
+
+    #[tokio::test]
+    async fn call_forward_get_put_and_disable() {
+        let app = test_router("k");
+
+        let res = call(
+            app.clone(),
+            axum::http::Request::builder()
+                .uri("/api/v1/call-forward")
+                .header("X-Api-Key", "k")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(res).await,
+            json!({"enabled": false, "e164": null})
+        );
+
+        let res = call(
+            app.clone(),
+            axum::http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/call-forward")
+                .header("X-Api-Key", "k")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"e164":"09121234567"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(res).await,
+            json!({"enabled": true, "e164": "+989121234567"})
+        );
+
+        let res = call(
+            app.clone(),
+            axum::http::Request::builder()
+                .uri("/api/v1/call-forward")
+                .header("X-Api-Key", "k")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(res).await,
+            json!({"enabled": true, "e164": "+989121234567"})
+        );
+
+        let res = call(
+            app,
+            axum::http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/call-forward")
+                .header("X-Api-Key", "k")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"e164":null}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(res).await,
+            json!({"enabled": false, "e164": null})
+        );
+    }
+
+    #[tokio::test]
+    async fn call_forward_put_requires_nonempty_e164() {
+        for body in [r#"{}"#, r#"{"e164":""}"#, r#"{"e164":"  "}"#] {
+            let res = call(
+                test_router("k"),
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/call-forward")
+                    .header("X-Api-Key", "k")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "body: {body}");
+            assert_eq!(body_json(res).await["error"], "validation");
+        }
     }
 
     #[tokio::test]

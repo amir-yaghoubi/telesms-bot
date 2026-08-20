@@ -11,6 +11,7 @@ servers:
 tags:
   - name: Health
   - name: Status
+  - name: Call forward
   - name: Contacts
   - name: Messaging
   - name: History
@@ -50,6 +51,67 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "500":
           $ref: "#/components/responses/InternalError"
+
+  /api/v1/call-forward:
+    get:
+      tags: [Call forward]
+      summary: Get call-forward state
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: Current call-forward state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CallForwardState"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          description: Modem unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    put:
+      tags: [Call forward]
+      summary: Set or disable call forwarding
+      description: Set `e164` to a number to enable forwarding, or to `null` to disable it.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                e164:
+                  type: string
+                  nullable: true
+              required: [e164]
+              additionalProperties: false
+      responses:
+        "200":
+          description: Updated call-forward state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CallForwardState"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          description: Modem unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /api/v1/search:
     post:
@@ -438,6 +500,16 @@ components:
             $ref: "#/components/schemas/ErrorResponse"
 
   schemas:
+    CallForwardState:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+        e164:
+          type: string
+          nullable: true
+      required: [enabled, e164]
+
     ErrorResponse:
       type: object
       properties:
