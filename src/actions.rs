@@ -1383,7 +1383,10 @@ mod tests {
         );
         assert_eq!(
             tg.reactions.lock().unwrap().as_slice(),
-            &[(7, crate::app::SEND_PENDING.into()), (7, crate::app::SEND_ACK.into())]
+            &[
+                (7, crate::app::SEND_PENDING.into()),
+                (7, crate::app::SEND_REACT_OK.into()),
+            ]
         );
         assert!(tg.replies.lock().unwrap().is_empty());
     }

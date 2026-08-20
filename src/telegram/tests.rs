@@ -182,7 +182,10 @@ async fn sms_known_contact_creates_topic_sends_and_acks() {
     );
     assert_eq!(
         tg.reactions.lock().unwrap().as_slice(),
-        &[(7, crate::app::SEND_PENDING.into()), (7, crate::app::SEND_ACK.into())]
+        &[
+            (7, crate::app::SEND_PENDING.into()),
+            (7, crate::app::SEND_REACT_OK.into()),
+        ]
     );
     assert!(tg.replies.lock().unwrap().is_empty());
     assert!(db.get_topic_by_contact(id).unwrap().is_some());
@@ -290,7 +293,10 @@ async fn num_callback_sends_pending_text() {
     );
     assert_eq!(
         tg.reactions.lock().unwrap().as_slice(),
-        &[(11, crate::app::SEND_PENDING.into()), (11, crate::app::SEND_ACK.into())]
+        &[
+            (11, crate::app::SEND_PENDING.into()),
+            (11, crate::app::SEND_REACT_OK.into()),
+        ]
     );
     assert!(tg.replies.lock().unwrap().is_empty());
     assert!(db.take_pending_outbound(9).unwrap().is_none());
@@ -436,7 +442,10 @@ async fn sms_ignored_number_stays_in_general() {
     );
     assert_eq!(
         tg.reactions.lock().unwrap().as_slice(),
-        &[(7, crate::app::SEND_PENDING.into()), (7, crate::app::SEND_ACK.into())]
+        &[
+            (7, crate::app::SEND_PENDING.into()),
+            (7, crate::app::SEND_REACT_OK.into()),
+        ]
     );
     assert!(tg.replies.lock().unwrap().is_empty());
     assert!(db.get_topic_by_e164("+989121234567").unwrap().is_none());
@@ -477,7 +486,10 @@ async fn sms_does_not_apply_incoming_default() {
     );
     assert_eq!(
         tg.reactions.lock().unwrap().as_slice(),
-        &[(7, crate::app::SEND_PENDING.into()), (7, crate::app::SEND_ACK.into())]
+        &[
+            (7, crate::app::SEND_PENDING.into()),
+            (7, crate::app::SEND_REACT_OK.into()),
+        ]
     );
     assert!(tg.replies.lock().unwrap().is_empty());
 }

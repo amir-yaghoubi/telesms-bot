@@ -150,9 +150,10 @@ pub async fn watch_inbox<I>(
     }
 }
 
-pub const SEND_PENDING: &str = "📨";
+pub const SEND_PENDING: &str = "👀";
 pub const SEND_ACK: &str = "✅";
-pub const SEND_FAIL: &str = "❌";
+pub const SEND_REACT_OK: &str = "👍";
+pub const SEND_FAIL: &str = "👎";
 
 #[async_trait::async_trait]
 pub trait TelegramSink: Send + Sync {
@@ -552,7 +553,7 @@ pub async fn send_and_ack(
         Ok(path) => {
             db.record_outbound(e164, text, "ok", thread_id)?;
             let ack_result = match reply_to {
-                Some(id) => tg.react(id, SEND_ACK).await,
+                Some(id) => tg.react(id, SEND_REACT_OK).await,
                 None => ack_send(tg, thread_id, SEND_ACK, None).await,
             };
             if let Err(err) = ack_result {
@@ -818,7 +819,7 @@ mod tests {
         assert_eq!(sent.as_slice(), &[("+989121234567".into(), "hello".into())]);
         assert_eq!(
             tg.reactions.lock().unwrap().as_slice(),
-            &[(7, SEND_PENDING.into()), (7, SEND_ACK.into())]
+            &[(7, SEND_PENDING.into()), (7, SEND_REACT_OK.into())]
         );
         assert!(tg.replies.lock().unwrap().is_empty());
     }
@@ -868,11 +869,19 @@ mod tests {
     async fn fake_tg_react_records_emoji() {
         let tg = FakeTg::new();
         tg.react(7, SEND_PENDING).await.unwrap();
-        tg.react(7, SEND_ACK).await.unwrap();
+        tg.react(7, SEND_REACT_OK).await.unwrap();
         assert_eq!(
             tg.reactions.lock().unwrap().as_slice(),
-            &[(7, SEND_PENDING.into()), (7, SEND_ACK.into())]
+            &[(7, SEND_PENDING.into()), (7, SEND_REACT_OK.into())]
         );
+    }
+
+    #[test]
+    fn send_status_emoji_match_telegram_reactions() {
+        assert_eq!(SEND_PENDING, "👀");
+        assert_eq!(SEND_REACT_OK, "👍");
+        assert_eq!(SEND_FAIL, "👎");
+        assert_eq!(SEND_ACK, "✅");
     }
 
     #[tokio::test]
@@ -889,7 +898,7 @@ mod tests {
         );
         assert_eq!(
             tg.reactions.lock().unwrap().as_slice(),
-            &[(7, SEND_PENDING.into()), (7, SEND_ACK.into())]
+            &[(7, SEND_PENDING.into()), (7, SEND_REACT_OK.into())]
         );
         assert!(tg.replies.lock().unwrap().is_empty());
         assert!(tg.posts.lock().unwrap().is_empty());
