@@ -107,6 +107,8 @@ impl Db {
         let _ = conn.execute("ALTER TABLE topics ADD COLUMN pending_outbound TEXT", []);
         let _ = conn.execute("ALTER TABLE topics ADD COLUMN pending_reply_to INTEGER", []);
         let _ = conn.execute("ALTER TABLE inbound_log ADD COLUMN sms_ts TEXT", []);
+        let _ = conn.execute("ALTER TABLE inbound_log ADD COLUMN thread_id INTEGER", []);
+        let _ = conn.execute("ALTER TABLE outbound_log ADD COLUMN thread_id INTEGER", []);
         Ok(Db {
             conn: Mutex::new(conn),
             contacts_available: AtomicBool::new(true),
@@ -457,22 +459,29 @@ impl Db {
         text: &str,
         tg_msg: Option<i32>,
         sms_ts: &str,
+        thread_id: i32,
     ) -> Result<(), DbError> {
         let conn = self.conn()?;
         conn.execute(
-            "INSERT INTO inbound_log (mm_path, e164, body, tg_msg, created_at, sms_ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![path, e164, text, tg_msg, Self::now(), sms_ts],
+            "INSERT INTO inbound_log (mm_path, e164, body, tg_msg, created_at, sms_ts, thread_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![path, e164, text, tg_msg, Self::now(), sms_ts, thread_id],
         )?;
         Ok(())
     }
 
-    pub fn record_outbound(&self, e164: &str, text: &str, result: &str) -> Result<(), DbError> {
+    pub fn record_outbound(
+        &self,
+        e164: &str,
+        text: &str,
+        result: &str,
+        thread_id: i32,
+    ) -> Result<(), DbError> {
         let conn = self.conn()?;
         conn.execute(
-            "INSERT INTO outbound_log (e164, body, result, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![e164, text, result, Self::now()],
+            "INSERT INTO outbound_log (e164, body, result, created_at, thread_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![e164, text, result, Self::now(), thread_id],
         )?;
         Ok(())
     }
@@ -484,12 +493,13 @@ impl Db {
         e164: &str,
         body: &str,
         created_at: &str,
+        thread_id: Option<i32>,
     ) -> Result<(), DbError> {
         let conn = self.conn()?;
         conn.execute(
-            "INSERT INTO inbound_log (mm_path, e164, body, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![path, e164, body, created_at],
+            "INSERT INTO inbound_log (mm_path, e164, body, created_at, thread_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![path, e164, body, created_at, thread_id],
         )?;
         Ok(())
     }
@@ -607,7 +617,7 @@ mod tests {
     fn inbound_path_dedup() {
         let db = Db::open_in_memory().unwrap();
         assert!(!db.seen_sms_path("/sms/1").unwrap());
-        db.record_inbound("/sms/1", "+98912", "hi", None, "")
+        db.record_inbound("/sms/1", "+98912", "hi", None, "", 1)
             .unwrap();
         assert!(db.seen_sms_path("/sms/1").unwrap());
         assert!(db.seen_sms("/sms/1", "+98912", "hi", "").unwrap());
@@ -616,7 +626,7 @@ mod tests {
     #[test]
     fn seen_sms_same_content_different_path() {
         let db = Db::open_in_memory().unwrap();
-        db.record_inbound("/sms/1", "+98912", "hi", None, "2026-08-19T12:00:00+00:00")
+        db.record_inbound("/sms/1", "+98912", "hi", None, "2026-08-19T12:00:00+00:00", 1)
             .unwrap();
         assert!(db
             .seen_sms("/sms/2", "+98912", "hi", "2026-08-19T12:00:00+00:00")
@@ -629,7 +639,7 @@ mod tests {
     #[test]
     fn seen_sms_empty_ts_does_not_content_match() {
         let db = Db::open_in_memory().unwrap();
-        db.record_inbound("/sms/1", "+98912", "hi", None, "")
+        db.record_inbound("/sms/1", "+98912", "hi", None, "", 1)
             .unwrap();
         assert!(!db.seen_sms("/sms/2", "+98912", "hi", "").unwrap());
         assert!(db.seen_sms("/sms/1", "+98912", "hi", "").unwrap());
@@ -737,5 +747,32 @@ mod tests {
         assert!(db.contacts_available());
         db.set_contacts_available(false);
         assert!(!db.contacts_available());
+    }
+
+    #[test]
+    fn record_inbound_stores_thread_id() {
+        let db = Db::open_in_memory().unwrap();
+        db.record_inbound("/sms/1", "+98912", "hi", None, "", 42)
+            .unwrap();
+        let conn = db.conn().unwrap();
+        let tid: i32 = conn
+            .query_row(
+                "SELECT thread_id FROM inbound_log WHERE mm_path = ?1",
+                ["/sms/1"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tid, 42);
+    }
+
+    #[test]
+    fn record_outbound_stores_thread_id() {
+        let db = Db::open_in_memory().unwrap();
+        db.record_outbound("+98912", "bye", "ok", 7).unwrap();
+        let conn = db.conn().unwrap();
+        let tid: i32 = conn
+            .query_row("SELECT thread_id FROM outbound_log LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tid, 7);
     }
 }

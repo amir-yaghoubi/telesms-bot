@@ -303,18 +303,43 @@ pub async fn handle_incoming(
             ts = %sms.timestamp,
             "skip stale inbound sms"
         );
-        db.record_inbound(&sms.path, &id_e164, &sms.text, None, &sms.timestamp)?;
+        let thread_id = match route_inbound(db, &id_e164)? {
+            InboundDest::ExistingTopic { thread_id, .. } => thread_id,
+            InboundDest::CreateContactTopic { .. } | InboundDest::General { .. } => GENERAL_THREAD,
+        };
+        db.record_inbound(
+            &sms.path,
+            &id_e164,
+            &sms.text,
+            None,
+            &sms.timestamp,
+            thread_id,
+        )?;
         return Ok(());
     }
 
     match deliver_incoming(db, region, &sms, tg).await {
-        Ok(Delivered::Normalized(e164)) => {
+        Ok(Delivered::Normalized { e164, thread_id }) => {
             db.mark_incoming(&e164)?;
-            db.record_inbound(&sms.path, &e164, &sms.text, None, &sms.timestamp)?;
+            db.record_inbound(
+                &sms.path,
+                &e164,
+                &sms.text,
+                None,
+                &sms.timestamp,
+                thread_id,
+            )?;
             Ok(())
         }
-        Ok(Delivered::Raw) => {
-            db.record_inbound(&sms.path, &id_e164, &sms.text, None, &sms.timestamp)?;
+        Ok(Delivered::Raw { thread_id }) => {
+            db.record_inbound(
+                &sms.path,
+                &id_e164,
+                &sms.text,
+                None,
+                &sms.timestamp,
+                thread_id,
+            )?;
             Ok(())
         }
         Err(err) => {
@@ -409,8 +434,8 @@ fn sms_too_old(ts: &str) -> bool {
 }
 
 enum Delivered {
-    Normalized(String),
-    Raw,
+    Normalized { e164: String, thread_id: i32 },
+    Raw { thread_id: i32 },
 }
 
 async fn deliver_incoming(
@@ -424,11 +449,13 @@ async fn deliver_incoming(
         Err(_) => {
             tg.post(GENERAL_THREAD, format!("{}\n{}", sms.e164, sms.text))
                 .await?;
-            return Ok(Delivered::Raw);
+            return Ok(Delivered::Raw {
+                thread_id: GENERAL_THREAD,
+            });
         }
     };
 
-    match route_inbound(db, &e164)? {
+    let thread_id = match route_inbound(db, &e164)? {
         InboundDest::CreateContactTopic {
             contact_id,
             title,
@@ -443,6 +470,7 @@ async fn deliver_incoming(
                 ignored: false,
             })?;
             tg.post(thread_id, sms.text.clone()).await?;
+            thread_id
         }
         InboundDest::ExistingTopic {
             thread_id,
@@ -452,14 +480,16 @@ async fn deliver_incoming(
                 tg.post(thread_id, format!("now using {switched}")).await?;
             }
             tg.post(thread_id, sms.text.clone()).await?;
+            thread_id
         }
         InboundDest::General { e164: dest_e164 } => {
             tg.post(GENERAL_THREAD, format!("{dest_e164}\n{}", sms.text))
                 .await?;
+            GENERAL_THREAD
         }
-    }
+    };
 
-    Ok(Delivered::Normalized(e164))
+    Ok(Delivered::Normalized { e164, thread_id })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -493,7 +523,7 @@ pub async fn send_and_ack(
 ) -> Result<(), ActionError> {
     match modem.send(e164, text).await {
         Ok(path) => {
-            db.record_outbound(e164, text, "ok")?;
+            db.record_outbound(e164, text, "ok", thread_id)?;
             if let Err(err) = ack_send(tg, thread_id, SEND_ACK, reply_to).await {
                 return Err(ActionError::TelegramFailed {
                     sent: true,
@@ -505,7 +535,7 @@ pub async fn send_and_ack(
         }
         Err(err) => {
             let err_s = err.to_string();
-            db.record_outbound(e164, text, &err_s)?;
+            db.record_outbound(e164, text, &err_s, thread_id)?;
             let _ = ack_send(tg, thread_id, &err_s, reply_to).await;
             Err(ActionError::ModemFailed(err_s))
         }

@@ -572,7 +572,13 @@ Contacts · OK"
     #[tokio::test]
     async fn gather_offline_still_has_counts() {
         let db = crate::db::Db::open_in_memory().unwrap();
-        db.insert_inbound_at("/a", "+989111111111", "x", "2026-08-19T10:00:00+00:00")
+        db.insert_inbound_at(
+            "/a",
+            "+989111111111",
+            "x",
+            "2026-08-19T10:00:00+00:00",
+            None,
+        )
             .unwrap();
         let id = db.upsert_contact("people/a", "Ali").unwrap();
         db.replace_contact_numbers(id, &["+989111111111".into()])
