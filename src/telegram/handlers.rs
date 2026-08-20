@@ -6,13 +6,12 @@ use teloxide::error_handlers::LoggingErrorHandler;
 use teloxide::prelude::*;
 use teloxide::types::{BotCommandScope, CallbackQuery, ChatId, InlineQuery, MessageId, ParseMode};
 
-use crate::actions::{ignore, list_numbers, open_topic, search_contacts, set_default_number, who, ActionError, Identity};
-use crate::app::{handle_owner_text, send_and_ack, AppError, OwnerTextOutcome, TelegramSink};
+use crate::actions::{ignore, list_numbers, open_topic, search_contacts, send_sms, set_default_number, who, ActionError, Identity};
+use crate::app::{handle_owner_text, AppError, OwnerTextOutcome, TelegramSink};
 use crate::config::Config;
 use crate::db::{Contact, Db, Topic};
 use crate::modem::SmsModem;
-use crate::route::{route_for_send, InboundDest, GENERAL_THREAD};
-use crate::normalize::normalize_e164;
+use crate::route::GENERAL_THREAD;
 
 use super::keyboards::{
     inline_answer_articles, inline_query_results, number_keyboard, search_keyboard, status_keyboard,
@@ -291,60 +290,31 @@ pub async fn handle_sms(
     tg: &dyn TelegramSink,
     delete_enabled: bool,
 ) -> Result<(), AppError> {
-    let e164 = match normalize_e164(raw_number, region) {
-        Ok(e164) => e164,
-        Err(err) => {
-            tg.post(reply_thread, err.to_string()).await?;
-            return Ok(());
-        }
-    };
-
-    let thread_id = match route_for_send(db, &e164)? {
-        InboundDest::CreateContactTopic {
-            contact_id,
-            title,
-            default_e164,
-        } => {
-            let thread_id = tg.create_topic(title.clone()).await?;
-            db.upsert_topic(&Topic {
-                thread_id,
-                contact_id: Some(contact_id),
-                default_e164: Some(default_e164),
-                title,
-                ignored: false,
-            })?;
-            thread_id
-        }
-        InboundDest::ExistingTopic { thread_id, .. } => thread_id,
-        InboundDest::General { e164: dest } => {
-            if db.is_ignored(&dest)? {
-                reply_thread
-            } else {
-                let thread_id = tg.create_topic(dest.clone()).await?;
-                db.upsert_topic(&Topic {
-                    thread_id,
-                    contact_id: None,
-                    default_e164: Some(dest.clone()),
-                    title: dest,
-                    ignored: false,
-                })?;
-                thread_id
-            }
-        }
-    };
-
-    send_and_ack(
+    match send_sms(
         db,
-        &e164,
+        region,
+        &Identity {
+            number: Some(raw_number.to_string()),
+            ..Default::default()
+        },
         text,
-        thread_id,
+        reply_thread,
         reply_to,
         modem,
         tg,
         delete_enabled,
     )
-    .await?;
-    Ok(())
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(ActionError::InvalidNumber(msg)) => {
+            tg.post(reply_thread, msg).await?;
+            Ok(())
+        }
+        Err(ActionError::ModemFailed(_)) => Ok(()),
+        Err(ActionError::Db(e)) => Err(e.into()),
+        Err(e) => Err(AppError::Telegram(e.to_string())),
+    }
 }
 
 async fn post_status(

@@ -405,6 +405,136 @@ pub async fn open_topic(
     Err(ActionError::NotFound("unknown contact".into()))
 }
 
+#[derive(Debug, Clone)]
+pub struct SmsSent {
+    pub e164: String,
+    pub thread_id: i32,
+    pub sent: bool,
+}
+
+async fn resolve_send_thread(
+    db: &Db,
+    e164: &str,
+    reply_thread: i32,
+    tg: &dyn TelegramSink,
+) -> Result<i32, ActionError> {
+    use crate::route::{route_for_send, InboundDest};
+
+    Ok(match route_for_send(db, e164)? {
+        InboundDest::CreateContactTopic {
+            contact_id,
+            title,
+            default_e164,
+        } => {
+            let thread_id = tg.create_topic(title.clone()).await?;
+            db.upsert_topic(&Topic {
+                thread_id,
+                contact_id: Some(contact_id),
+                default_e164: Some(default_e164),
+                title,
+                ignored: false,
+            })?;
+            thread_id
+        }
+        InboundDest::ExistingTopic { thread_id, .. } => thread_id,
+        InboundDest::General { e164: dest } => {
+            if db.is_ignored(&dest)? {
+                reply_thread
+            } else {
+                let thread_id = tg.create_topic(dest.clone()).await?;
+                db.upsert_topic(&Topic {
+                    thread_id,
+                    contact_id: None,
+                    default_e164: Some(dest.clone()),
+                    title: dest,
+                    ignored: false,
+                })?;
+                thread_id
+            }
+        }
+    })
+}
+
+pub async fn send_sms(
+    db: &Db,
+    region: &str,
+    id: &Identity,
+    text: &str,
+    reply_thread: i32,
+    reply_to: Option<i32>,
+    modem: &dyn crate::modem::SmsModem,
+    tg: &dyn TelegramSink,
+    delete_enabled: bool,
+) -> Result<SmsSent, ActionError> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(ActionError::Validation("text required".into()));
+    }
+
+    if id
+        .number
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some()
+    {
+        let resolved = resolve(db, region, id, ResolveMode::AllowBareNumber)?;
+        let e164 = resolved
+            .e164
+            .ok_or_else(|| ActionError::InvalidNumber("missing number".into()))?;
+        let thread_id = resolve_send_thread(db, &e164, reply_thread, tg).await?;
+        crate::app::send_and_ack(
+            db,
+            &e164,
+            text,
+            thread_id,
+            reply_to,
+            modem,
+            tg,
+            delete_enabled,
+        )
+        .await?;
+        return Ok(SmsSent {
+            e164,
+            thread_id,
+            sent: true,
+        });
+    }
+
+    if id.contact_id.is_none() {
+        return Err(ActionError::MissingIdentity);
+    }
+    let resolved = resolve(db, region, id, ResolveMode::RequireTopic)?;
+    let topic = resolved
+        .topic
+        .as_ref()
+        .ok_or_else(|| ActionError::NotFound("unknown topic".into()))?;
+    let e164 = match &topic.default_e164 {
+        Some(e164) => e164.clone(),
+        None => {
+            let numbers = topic_numbers(db, topic)?;
+            return Err(ActionError::NeedDefaultNumber { numbers });
+        }
+    };
+    let thread_id = topic.thread_id;
+    crate::app::send_and_ack(
+        db,
+        &e164,
+        text,
+        thread_id,
+        reply_to,
+        modem,
+        tg,
+        delete_enabled,
+    )
+    .await?;
+    Ok(SmsSent {
+        e164,
+        thread_id,
+        sent: true,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -722,6 +852,107 @@ mod tests {
         .unwrap();
         assert!(o.created);
         assert!(o.title.starts_with('+'));
+    }
+
+    #[tokio::test]
+    async fn send_by_number_creates_and_acks() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db.upsert_contact("people/a", "Ali").unwrap();
+        db.replace_contact_numbers(id, &["+989121234567".into()])
+            .unwrap();
+        let tg = crate::app::FakeTg::new();
+        let modem = crate::modem::FakeModem::default();
+        let s = send_sms(
+            &db,
+            "IR",
+            &Identity {
+                number: Some("09121234567".into()),
+                ..Default::default()
+            },
+            "hello",
+            1,
+            Some(7),
+            &modem,
+            &tg,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(s.e164, "+989121234567");
+        assert_eq!(
+            modem.sent.lock().unwrap().as_slice(),
+            &[("+989121234567".into(), "hello".into())]
+        );
+        assert_eq!(
+            tg.replies.lock().unwrap().last().map(|p| p.1.as_str()),
+            Some("✅")
+        );
+    }
+
+    #[tokio::test]
+    async fn send_to_default_need_number() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db.upsert_contact("people/a", "Ali").unwrap();
+        db.replace_contact_numbers(id, &["+98912".into(), "+98913".into()])
+            .unwrap();
+        db.upsert_topic(&Topic {
+            thread_id: 9,
+            contact_id: Some(id),
+            default_e164: None,
+            title: "Ali".into(),
+            ignored: false,
+        })
+        .unwrap();
+        let tg = crate::app::FakeTg::new();
+        let modem = crate::modem::FakeModem::default();
+        let err = send_sms(
+            &db,
+            "IR",
+            &Identity {
+                contact_id: Some(id),
+                ..Default::default()
+            },
+            "hi",
+            9,
+            None,
+            &modem,
+            &tg,
+            true,
+        )
+        .await
+        .unwrap_err();
+        match err {
+            ActionError::NeedDefaultNumber { numbers } => {
+                assert_eq!(numbers.len(), 2);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(modem.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_modem_fail_is_error() {
+        let db = Db::open_in_memory().unwrap();
+        let tg = crate::app::FakeTg::new();
+        let mut modem = crate::modem::FakeModem::default();
+        modem.fail = true;
+        let err = send_sms(
+            &db,
+            "IR",
+            &Identity {
+                number: Some("09121234567".into()),
+                ..Default::default()
+            },
+            "x",
+            1,
+            None,
+            &modem,
+            &tg,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ActionError::ModemFailed(_)));
     }
 
     #[tokio::test]

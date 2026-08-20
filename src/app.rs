@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::db::{Db, Topic};
 use crate::modem::{IncomingSms, ModemError, ModemInfo, SmsInbox, SmsModem};
+use crate::actions::ActionError;
 use crate::modem_mm::MmModem;
 use crate::normalize::normalize_e164;
 use crate::route::{plan_outbound, route_inbound, InboundDest, OutboundPlan, GENERAL_THREAD};
@@ -489,20 +490,26 @@ pub async fn send_and_ack(
     modem: &dyn SmsModem,
     tg: &dyn TelegramSink,
     delete_enabled: bool,
-) -> Result<(), AppError> {
+) -> Result<(), ActionError> {
     match modem.send(e164, text).await {
         Ok(path) => {
             db.record_outbound(e164, text, "ok")?;
-            ack_send(tg, thread_id, SEND_ACK, reply_to).await?;
+            if let Err(err) = ack_send(tg, thread_id, SEND_ACK, reply_to).await {
+                return Err(ActionError::TelegramFailed {
+                    sent: true,
+                    message: err.to_string(),
+                });
+            }
             maybe_delete(delete_enabled, modem, &path).await;
+            Ok(())
         }
         Err(err) => {
             let err_s = err.to_string();
             db.record_outbound(e164, text, &err_s)?;
-            ack_send(tg, thread_id, &err_s, reply_to).await?;
+            let _ = ack_send(tg, thread_id, &err_s, reply_to).await;
+            Err(ActionError::ModemFailed(err_s))
         }
     }
-    Ok(())
 }
 
 pub async fn handle_owner_text(
@@ -526,7 +533,7 @@ pub async fn handle_owner_text(
             Ok(OwnerTextOutcome::NeedNumber(numbers))
         }
         OutboundPlan::Send { e164 } => {
-            send_and_ack(
+            match send_and_ack(
                 db,
                 &e164,
                 text,
@@ -536,7 +543,13 @@ pub async fn handle_owner_text(
                 tg,
                 delete_enabled,
             )
-            .await?;
+            .await
+            {
+                Ok(()) => {}
+                Err(ActionError::ModemFailed(_)) => {}
+                Err(ActionError::Db(e)) => return Err(e.into()),
+                Err(e) => return Err(AppError::Telegram(e.to_string())),
+            }
             Ok(OwnerTextOutcome::Done)
         }
     }
@@ -774,9 +787,10 @@ mod tests {
             fail: true,
             ..FakeModem::default()
         };
-        send_and_ack(&db, "+98912", "hi", 42, None, &modem, &tg, true)
+        let err = send_and_ack(&db, "+98912", "hi", 42, None, &modem, &tg, true)
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(matches!(err, ActionError::ModemFailed(_)));
         assert!(modem.deleted.lock().unwrap().is_empty());
         assert_eq!(
             tg.posts.lock().unwrap().as_slice(),
