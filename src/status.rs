@@ -52,11 +52,7 @@ pub fn radio_label(radio: Radio) -> &'static str {
     }
 }
 
-pub fn format_relative(
-    then: chrono::DateTime<Utc>,
-    now: chrono::DateTime<Utc>,
-    tz: Tz,
-) -> String {
+pub fn format_relative(then: chrono::DateTime<Utc>, now: chrono::DateTime<Utc>, tz: Tz) -> String {
     let age = now.signed_duration_since(then);
     if age < chrono::Duration::minutes(1) {
         return "just now".into();
@@ -409,10 +405,22 @@ Contacts · OK"
 
     #[test]
     fn radio_from_bits() {
-        assert_eq!(crate::modem::radio_from_access_tech(1 << 15), Some(Radio::Nr));
-        assert_eq!(crate::modem::radio_from_access_tech(1 << 14), Some(Radio::Lte));
-        assert_eq!(crate::modem::radio_from_access_tech(1 << 5), Some(Radio::Umts));
-        assert_eq!(crate::modem::radio_from_access_tech(1 << 1), Some(Radio::Gsm));
+        assert_eq!(
+            crate::modem::radio_from_access_tech(1 << 15),
+            Some(Radio::Nr)
+        );
+        assert_eq!(
+            crate::modem::radio_from_access_tech(1 << 14),
+            Some(Radio::Lte)
+        );
+        assert_eq!(
+            crate::modem::radio_from_access_tech(1 << 5),
+            Some(Radio::Umts)
+        );
+        assert_eq!(
+            crate::modem::radio_from_access_tech(1 << 1),
+            Some(Radio::Gsm)
+        );
         assert_eq!(crate::modem::radio_from_access_tech(0), None);
         assert_eq!(radio_label(Radio::Umts), "3G");
         assert_eq!(radio_label(Radio::Lte), "4G LTE");
@@ -447,13 +455,8 @@ Contacts · OK"
     #[tokio::test]
     async fn gather_offline_still_has_counts() {
         let db = crate::db::Db::open_in_memory().unwrap();
-        db.insert_inbound_at(
-            "/a",
-            "+989111111111",
-            "x",
-            "2026-08-19T10:00:00+00:00",
-        )
-        .unwrap();
+        db.insert_inbound_at("/a", "+989111111111", "x", "2026-08-19T10:00:00+00:00")
+            .unwrap();
         let id = db.upsert_contact("people/a", "Ali").unwrap();
         db.replace_contact_numbers(id, &["+989111111111".into()])
             .unwrap();

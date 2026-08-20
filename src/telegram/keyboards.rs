@@ -35,7 +35,9 @@ pub fn inline_answer_articles(
     }
 }
 
-pub(crate) fn inline_query_results(articles: &[(String, String, String)]) -> Vec<InlineQueryResult> {
+pub(crate) fn inline_query_results(
+    articles: &[(String, String, String)],
+) -> Vec<InlineQueryResult> {
     articles
         .iter()
         .map(|(id, title, description)| {

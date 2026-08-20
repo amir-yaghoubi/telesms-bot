@@ -4,13 +4,9 @@ use teloxide::dispatching::dialogue::GetChatId;
 use teloxide::dispatching::{Dispatcher, UpdateHandler};
 use teloxide::error_handlers::LoggingErrorHandler;
 use teloxide::prelude::*;
-use teloxide::types::{
-    BotCommandScope, CallbackQuery, ChatId, InlineQuery, MessageId, ParseMode,
-};
+use teloxide::types::{BotCommandScope, CallbackQuery, ChatId, InlineQuery, MessageId, ParseMode};
 
-use crate::app::{
-    handle_owner_text, send_and_ack, AppError, OwnerTextOutcome, TelegramSink,
-};
+use crate::app::{handle_owner_text, send_and_ack, AppError, OwnerTextOutcome, TelegramSink};
 use crate::config::Config;
 use crate::db::{Contact, Db, Topic};
 use crate::modem::SmsModem;
@@ -21,9 +17,9 @@ use super::keyboards::{
     inline_answer_articles, inline_query_results, number_keyboard, search_keyboard, status_keyboard,
 };
 use super::parse::{
-    allow_dm_callback, allowed, bot_commands, help_text, is_owner_dm, parse_cmd_name,
-    parse_ignore_reply, parse_num_callback, parse_open_callback, parse_open_cmd, parse_search_query,
-    parse_sms_cmd, parse_status_refresh, topic_open_message, format_who,
+    allow_dm_callback, allowed, bot_commands, format_who, help_text, is_owner_dm, parse_cmd_name,
+    parse_ignore_reply, parse_num_callback, parse_open_callback, parse_open_cmd,
+    parse_search_query, parse_sms_cmd, parse_status_refresh, topic_open_message,
 };
 use super::sink::RealTg;
 use super::util::{edit_failed_is_noop, forum_thread, thread_id_i32};
@@ -136,8 +132,7 @@ async fn send_number_buttons(
     if let Some(thread) = forum_thread(thread_id) {
         req = req.message_thread_id(thread);
     }
-    req.await
-        .map_err(|e| AppError::Telegram(e.to_string()))?;
+    req.await.map_err(|e| AppError::Telegram(e.to_string()))?;
     Ok(())
 }
 
@@ -499,8 +494,7 @@ async fn on_message(
                 if let Some(thread) = forum_thread(thread_id) {
                     req = req.message_thread_id(thread);
                 }
-                req.await
-                    .map_err(|e| AppError::Telegram(e.to_string()))?;
+                req.await.map_err(|e| AppError::Telegram(e.to_string()))?;
             }
         }
         Some("open") => {

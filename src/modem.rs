@@ -206,11 +206,7 @@ impl SmsModem for FakeModem {
 #[async_trait::async_trait]
 impl SmsInbox for FakeModem {
     async fn list_sms(&self) -> Result<Vec<IncomingSms>, ModemError> {
-        Ok(self
-            .listed
-            .lock()
-            .expect("fake modem listed lock")
-            .clone())
+        Ok(self.listed.lock().expect("fake modem listed lock").clone())
     }
 
     async fn subscribe_added(

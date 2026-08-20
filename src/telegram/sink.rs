@@ -17,8 +17,7 @@ impl TelegramSink for RealTg {
         if let Some(thread) = forum_thread(thread_id) {
             req = req.message_thread_id(thread);
         }
-        req.await
-            .map_err(|e| AppError::Telegram(e.to_string()))?;
+        req.await.map_err(|e| AppError::Telegram(e.to_string()))?;
         Ok(())
     }
 
@@ -30,8 +29,7 @@ impl TelegramSink for RealTg {
         if let Some(thread) = forum_thread(thread_id) {
             req = req.message_thread_id(thread);
         }
-        req.await
-            .map_err(|e| AppError::Telegram(e.to_string()))?;
+        req.await.map_err(|e| AppError::Telegram(e.to_string()))?;
         Ok(())
     }
 

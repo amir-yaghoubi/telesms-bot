@@ -47,8 +47,7 @@ impl Config {
                     .unwrap_or_else(|_| "./secrets/google-token.json".to_string()),
             ),
             database_path: PathBuf::from(
-                env::var("DATABASE_PATH")
-                    .unwrap_or_else(|_| "./data/telesms.sqlite".to_string()),
+                env::var("DATABASE_PATH").unwrap_or_else(|_| "./data/telesms.sqlite".to_string()),
             ),
             contacts_sync_interval: Duration::from_secs(
                 env::var("CONTACTS_SYNC_INTERVAL_SECS")
@@ -90,13 +89,15 @@ fn parse_tz(raw: Option<String>) -> Result<chrono_tz::Tz, ConfigError> {
     match raw {
         None => Ok(chrono_tz::Asia::Tehran),
         Some(s) if s.is_empty() => Ok(chrono_tz::Asia::Tehran),
-        Some(s) => s.parse::<chrono_tz::Tz>().map_err(|e| ConfigError::Invalid {
-            key: "STATUS_TZ",
-            source: Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                e.to_string(),
-            )),
-        }),
+        Some(s) => s
+            .parse::<chrono_tz::Tz>()
+            .map_err(|e| ConfigError::Invalid {
+                key: "STATUS_TZ",
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    e.to_string(),
+                )),
+            }),
     }
 }
 
@@ -106,9 +107,7 @@ fn parse_sms_delete_enabled(raw: &str) -> Result<bool, ConfigError> {
         "false" | "0" | "no" => Ok(false),
         _ => Err(ConfigError::Invalid {
             key: "SMS_DELETE_ENABLED",
-            source: Box::new(ParseError(
-                "expected true/1/yes or false/0/no".into(),
-            )),
+            source: Box::new(ParseError("expected true/1/yes or false/0/no".into())),
         }),
     }
 }
@@ -121,12 +120,10 @@ fn parse_required<T: std::str::FromStr>(key: &'static str) -> Result<T, ConfigEr
 where
     T::Err: std::error::Error + Send + Sync + 'static,
 {
-    required(key)?
-        .parse()
-        .map_err(|e| ConfigError::Invalid {
-            key,
-            source: Box::new(e),
-        })
+    required(key)?.parse().map_err(|e| ConfigError::Invalid {
+        key,
+        source: Box::new(e),
+    })
 }
 
 #[cfg(test)]
@@ -173,7 +170,10 @@ mod tests {
         assert_eq!(c.telegram_user_id, 42);
         assert_eq!(c.modem_uid, "dwm222");
         assert_eq!(c.database_path.as_os_str(), "./data/telesms.sqlite");
-        assert_eq!(c.google_token_path.as_os_str(), "./secrets/google-token.json");
+        assert_eq!(
+            c.google_token_path.as_os_str(),
+            "./secrets/google-token.json"
+        );
         assert_eq!(c.contacts_sync_interval.as_secs(), 21600);
         assert_eq!(c.default_region, "IR");
         assert_eq!(c.status_tz, chrono_tz::Asia::Tehran);
@@ -226,7 +226,10 @@ mod tests {
         }
         for v in ["true", "1", "yes", "YES", ""] {
             std::env::set_var("SMS_DELETE_ENABLED", v);
-            assert!(Config::from_env().unwrap().sms_delete_enabled, "value {v:?}");
+            assert!(
+                Config::from_env().unwrap().sms_delete_enabled,
+                "value {v:?}"
+            );
         }
     }
 

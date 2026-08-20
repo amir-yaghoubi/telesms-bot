@@ -5,8 +5,8 @@ use super::handlers::{
 use super::keyboards::{inline_answer_articles, inline_articles, search_keyboard};
 use super::parse::{
     allow_dm_callback, allowed, bot_commands, format_who, help_text, is_owner_dm, parse_cmd_name,
-    parse_ignore_reply, parse_num_callback, parse_open_callback, parse_open_cmd, parse_search_query,
-    parse_sms_cmd, parse_status_refresh, topic_open_message,
+    parse_ignore_reply, parse_num_callback, parse_open_callback, parse_open_cmd,
+    parse_search_query, parse_sms_cmd, parse_status_refresh, topic_open_message,
 };
 use super::util::{edit_failed_is_noop, forum_thread};
 use crate::app::FakeTg;
@@ -84,9 +84,19 @@ async fn sms_known_contact_creates_topic_sends_and_acks() {
         .unwrap();
     let tg = FakeTg::new();
     let modem = FakeModem::default();
-    handle_sms(&db, "IR", "09121234567", "hello", 1, Some(7), &modem, &tg, true)
-        .await
-        .unwrap();
+    handle_sms(
+        &db,
+        "IR",
+        "09121234567",
+        "hello",
+        1,
+        Some(7),
+        &modem,
+        &tg,
+        true,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         modem.sent.lock().unwrap().as_slice(),
         &[("+989121234567".into(), "hello".into())]
@@ -174,11 +184,8 @@ async fn num_callback_sets_default_and_posts() {
 async fn num_callback_sends_pending_text() {
     let db = Db::open_in_memory().unwrap();
     let id = db.upsert_contact("people/a", "Ali").unwrap();
-    db.replace_contact_numbers(
-        id,
-        &["+989188086139".into(), "+989025438263".into()],
-    )
-    .unwrap();
+    db.replace_contact_numbers(id, &["+989188086139".into(), "+989025438263".into()])
+        .unwrap();
     db.upsert_topic(&Topic {
         thread_id: 9,
         contact_id: Some(id),
@@ -254,15 +261,29 @@ async fn sms_ignored_number_stays_in_general() {
     db.ignore_number("+989121234567").unwrap();
     let tg = FakeTg::new();
     let modem = FakeModem::default();
-    handle_sms(&db, "IR", "09121234567", "hello", 1, Some(7), &modem, &tg, true)
-        .await
-        .unwrap();
+    handle_sms(
+        &db,
+        "IR",
+        "09121234567",
+        "hello",
+        1,
+        Some(7),
+        &modem,
+        &tg,
+        true,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         modem.sent.lock().unwrap().as_slice(),
         &[("+989121234567".into(), "hello".into())]
     );
     assert_eq!(
-        tg.replies.lock().unwrap().last().map(|p| (p.0, p.1.as_str(), p.2)),
+        tg.replies
+            .lock()
+            .unwrap()
+            .last()
+            .map(|p| (p.0, p.1.as_str(), p.2)),
         Some((1, "✅", 7))
     );
     assert!(db.get_topic_by_e164("+989121234567").unwrap().is_none());
@@ -302,7 +323,11 @@ async fn sms_does_not_apply_incoming_default() {
         &[(b.into(), "hello".into())]
     );
     assert_eq!(
-        tg.replies.lock().unwrap().last().map(|p| (p.0, p.1.as_str(), p.2)),
+        tg.replies
+            .lock()
+            .unwrap()
+            .last()
+            .map(|p| (p.0, p.1.as_str(), p.2)),
         Some((42, "✅", 7))
     );
 }
@@ -315,9 +340,19 @@ async fn sms_send_ok_deletes_path() {
         .unwrap();
     let tg = FakeTg::new();
     let modem = FakeModem::default();
-    handle_sms(&db, "IR", "09121234567", "hello", 1, None, &modem, &tg, true)
-        .await
-        .unwrap();
+    handle_sms(
+        &db,
+        "IR",
+        "09121234567",
+        "hello",
+        1,
+        None,
+        &modem,
+        &tg,
+        true,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         modem.deleted.lock().unwrap().as_slice(),
         &["/fake/sms/1".into()] as &[String]
@@ -335,9 +370,19 @@ async fn sms_send_err_does_not_delete() {
         fail: true,
         ..FakeModem::default()
     };
-    handle_sms(&db, "IR", "09121234567", "hello", 1, None, &modem, &tg, true)
-        .await
-        .unwrap();
+    handle_sms(
+        &db,
+        "IR",
+        "09121234567",
+        "hello",
+        1,
+        None,
+        &modem,
+        &tg,
+        true,
+    )
+    .await
+    .unwrap();
     assert!(modem.deleted.lock().unwrap().is_empty());
 }
 

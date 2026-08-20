@@ -10,10 +10,7 @@ pub enum NormalizeError {
 }
 
 pub fn normalize_e164(raw: &str, default_region: &str) -> Result<String, NormalizeError> {
-    let cleaned: String = raw
-        .chars()
-        .filter(|c| *c != ' ' && *c != '-')
-        .collect();
+    let cleaned: String = raw.chars().filter(|c| *c != ' ' && *c != '-').collect();
 
     if cleaned.is_empty() {
         return Err(NormalizeError::Empty);
@@ -39,22 +36,34 @@ mod tests {
 
     #[test]
     fn ir_national_09() {
-        assert_eq!(normalize_e164("09121234567", "IR").unwrap(), "+989121234567");
+        assert_eq!(
+            normalize_e164("09121234567", "IR").unwrap(),
+            "+989121234567"
+        );
     }
 
     #[test]
     fn ir_without_plus() {
-        assert_eq!(normalize_e164("989121234567", "IR").unwrap(), "+989121234567");
+        assert_eq!(
+            normalize_e164("989121234567", "IR").unwrap(),
+            "+989121234567"
+        );
     }
 
     #[test]
     fn already_e164() {
-        assert_eq!(normalize_e164("+989121234567", "IR").unwrap(), "+989121234567");
+        assert_eq!(
+            normalize_e164("+989121234567", "IR").unwrap(),
+            "+989121234567"
+        );
     }
 
     #[test]
     fn other_plus_kept() {
-        assert_eq!(normalize_e164("+14155552671", "IR").unwrap(), "+14155552671");
+        assert_eq!(
+            normalize_e164("+14155552671", "IR").unwrap(),
+            "+14155552671"
+        );
     }
 
     #[test]
@@ -67,6 +76,9 @@ mod tests {
 
     #[test]
     fn empty_err() {
-        assert!(matches!(normalize_e164("  ", "IR"), Err(NormalizeError::Empty)));
+        assert!(matches!(
+            normalize_e164("  ", "IR"),
+            Err(NormalizeError::Empty)
+        ));
     }
 }

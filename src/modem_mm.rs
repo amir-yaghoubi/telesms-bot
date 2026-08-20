@@ -183,10 +183,7 @@ impl PathCache {
     }
 
     fn hit(&self) -> Option<OwnedObjectPath> {
-        self.path
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.path.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn store(&self, path: OwnedObjectPath) {
@@ -303,7 +300,7 @@ impl MmModem {
                 let paths = messaging.list().await.map_err(mm_err)?;
                 let mut out = Vec::with_capacity(paths.len());
                 for path in paths {
-                    match load_incoming_sms(&conn, &path).await {
+                    match load_incoming_sms_retry(&conn, &path).await {
                         Ok(sms) => out.push(sms),
                         Err(err) => tracing::warn!(path = %path, error = %err, "list sms skip"),
                     }
@@ -386,14 +383,27 @@ async fn load_incoming_sms(
     })
 }
 
+fn sms_text_ready(text: &str) -> bool {
+    !text.is_empty()
+}
+
 async fn load_incoming_sms_retry(
     conn: &Connection,
     path: &OwnedObjectPath,
 ) -> Result<IncomingSms, ModemError> {
     let mut last = None;
-    for attempt in 0..8 {
+    for attempt in 0..20 {
         match load_incoming_sms(conn, path).await {
-            Ok(sms) => return Ok(sms),
+            Ok(sms) if !sms.inbound || sms_text_ready(&sms.text) => return Ok(sms),
+            Ok(sms) => {
+                tracing::debug!(
+                    path = %path,
+                    attempt,
+                    e164 = %sms.e164,
+                    "sms text not decoded yet"
+                );
+                last = None;
+            }
             Err(err) => {
                 tracing::debug!(
                     path = %path,
@@ -404,9 +414,12 @@ async fn load_incoming_sms_retry(
                 last = Some(err);
             }
         }
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    Err(last.unwrap_or_else(|| ModemError::Failed(path.to_string())))
+    if let Some(err) = last {
+        return Err(err);
+    }
+    load_incoming_sms(conn, path).await
 }
 
 #[async_trait::async_trait]
@@ -557,6 +570,13 @@ mod tests {
     }
 
     #[test]
+    fn empty_inbound_text_is_not_decode_ready() {
+        assert!(!sms_text_ready(""));
+        assert!(sms_text_ready("hi"));
+        assert!(sms_text_ready("سلام\nline"));
+    }
+
+    #[test]
     fn unknown_object_fdo_is_already_gone() {
         let err = zbus::Error::FDO(Box::new(zbus::fdo::Error::UnknownObject("gone".into())));
         assert!(delete_already_gone(&err));
@@ -602,7 +622,10 @@ mod tests {
         assert!(cache.hit().is_none());
         let path = sample_path();
         cache.store(path.clone());
-        assert_eq!(cache.hit().as_ref().map(|p| p.as_str()), Some(path.as_str()));
+        assert_eq!(
+            cache.hit().as_ref().map(|p| p.as_str()),
+            Some(path.as_str())
+        );
         cache.invalidate();
         assert!(cache.hit().is_none());
     }

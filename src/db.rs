@@ -102,14 +102,8 @@ impl Db {
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(SCHEMA)?;
-        let _ = conn.execute(
-            "ALTER TABLE topics ADD COLUMN pending_outbound TEXT",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE topics ADD COLUMN pending_reply_to INTEGER",
-            [],
-        );
+        let _ = conn.execute("ALTER TABLE topics ADD COLUMN pending_outbound TEXT", []);
+        let _ = conn.execute("ALTER TABLE topics ADD COLUMN pending_reply_to INTEGER", []);
         let _ = conn.execute("ALTER TABLE inbound_log ADD COLUMN sms_ts TEXT", []);
         Ok(Db {
             conn: Mutex::new(conn),
@@ -545,10 +539,7 @@ impl Db {
         .map_err(Into::into)
     }
 
-    pub fn last_outbound_fail_since(
-        &self,
-        since_rfc3339: &str,
-    ) -> Result<Option<String>, DbError> {
+    pub fn last_outbound_fail_since(&self, since_rfc3339: &str) -> Result<Option<String>, DbError> {
         let conn = self.conn()?;
         conn.query_row(
             "SELECT result FROM outbound_log
@@ -709,7 +700,12 @@ mod tests {
     fn last_outbound_ok_skips_failures() {
         let db = Db::open_in_memory().unwrap();
         insert_out(&db, "+989111111111", "ok", "2026-08-19T01:00:00+00:00");
-        insert_out(&db, "+989111111122", "modem error: x", "2026-08-19T02:00:00+00:00");
+        insert_out(
+            &db,
+            "+989111111122",
+            "modem error: x",
+            "2026-08-19T02:00:00+00:00",
+        );
         let last = db.last_outbound_ok().unwrap().unwrap();
         assert_eq!(last.0, "+989111111111");
         let fail = db
