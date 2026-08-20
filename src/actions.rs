@@ -1,3 +1,4 @@
+use crate::app::TelegramSink;
 use crate::db::{Contact, Db, Topic};
 use crate::normalize::normalize_e164;
 use crate::route::GENERAL_THREAD;
@@ -220,6 +221,114 @@ pub fn who(db: &Db, region: &str, id: &Identity) -> Result<Who, ActionError> {
     })
 }
 
+#[derive(Debug, Clone)]
+pub struct NumberState {
+    pub thread_id: i32,
+    pub numbers: Vec<String>,
+    pub default_e164: Option<String>,
+}
+
+fn topic_numbers(db: &Db, topic: &Topic) -> Result<Vec<String>, ActionError> {
+    if let Some(contact_id) = topic.contact_id {
+        Ok(db.contact_numbers(contact_id)?)
+    } else {
+        Ok(topic.default_e164.clone().into_iter().collect())
+    }
+}
+
+pub fn list_numbers(db: &Db, region: &str, id: &Identity) -> Result<NumberState, ActionError> {
+    let w = who(db, region, id)?;
+    Ok(NumberState {
+        thread_id: w.thread_id,
+        numbers: w.numbers,
+        default_e164: w.default_e164,
+    })
+}
+
+pub async fn set_default_number(
+    db: &Db,
+    region: &str,
+    id: &Identity,
+    new_default: &str,
+    tg: &dyn TelegramSink,
+) -> Result<NumberState, ActionError> {
+    let resolved = resolve(db, region, id, ResolveMode::RequireTopic)?;
+    let topic = resolved
+        .topic
+        .as_ref()
+        .ok_or_else(|| ActionError::NotFound("unknown topic".into()))?;
+    let e164 = normalize_e164(new_default, region)
+        .map_err(|e| ActionError::InvalidNumber(e.to_string()))?;
+    let numbers = topic_numbers(db, topic)?;
+    if !numbers.contains(&e164) {
+        return Err(ActionError::Validation("number not on this topic".into()));
+    }
+    db.set_default_number(topic.thread_id, &e164)?;
+    tg.post(topic.thread_id, format!("default is {e164}"))
+        .await
+        .map_err(ActionError::from)?;
+    Ok(NumberState {
+        thread_id: topic.thread_id,
+        numbers,
+        default_e164: Some(e164),
+    })
+}
+
+pub async fn ignore(
+    db: &Db,
+    region: &str,
+    id: &Identity,
+    tg: &dyn TelegramSink,
+) -> Result<Vec<String>, ActionError> {
+    let has_number = id
+        .number
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some();
+
+    if has_number {
+        let resolved = resolve(db, region, id, ResolveMode::AllowBareNumber)?;
+        let e164 = resolved
+            .e164
+            .ok_or_else(|| ActionError::InvalidNumber("missing number".into()))?;
+        db.ignore_number(&e164)?;
+        if let Some(topic) = resolved.topic {
+            tg.post(topic.thread_id, format!("ignored {e164}"))
+                .await
+                .map_err(ActionError::from)?;
+        }
+        return Ok(vec![e164]);
+    }
+
+    let resolved = resolve(db, region, id, ResolveMode::RequireTopic)?;
+    let topic = resolved
+        .topic
+        .as_ref()
+        .ok_or_else(|| ActionError::NotFound("unknown topic".into()))?;
+    let mut targets = topic_numbers(db, topic)?;
+    if targets.is_empty() {
+        if let Some(e164) = &topic.default_e164 {
+            targets.push(e164.clone());
+        }
+    }
+    if targets.is_empty() {
+        return Err(ActionError::Validation(
+            "reply to a +number to ignore it".into(),
+        ));
+    }
+    for n in &targets {
+        db.ignore_number(n)?;
+    }
+    tg.post(
+        topic.thread_id,
+        format!("ignored {}", targets.join(", ")),
+    )
+    .await
+    .map_err(ActionError::from)?;
+    Ok(targets)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,5 +533,78 @@ mod tests {
         assert_eq!(w.thread_id, 9);
         assert_eq!(w.default_e164.as_deref(), Some("+989121234567"));
         assert!(w.numbers.contains(&"+989121234567".into()));
+    }
+
+    #[tokio::test]
+    async fn set_default_rejects_foreign_number() {
+        let (db, id) = seed();
+        let tg = crate::app::FakeTg::new();
+        let err = set_default_number(
+            &db,
+            "IR",
+            &Identity {
+                contact_id: Some(id),
+                ..Default::default()
+            },
+            "09139999999",
+            &tg,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ActionError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn set_default_posts_and_persists() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db.upsert_contact("people/a", "Ali").unwrap();
+        db.replace_contact_numbers(id, &["+98912".into(), "+98913".into()])
+            .unwrap();
+        db.upsert_topic(&Topic {
+            thread_id: 9,
+            contact_id: Some(id),
+            default_e164: Some("+98912".into()),
+            title: "Ali".into(),
+            ignored: false,
+        })
+        .unwrap();
+        let tg = crate::app::FakeTg::new();
+        let st = set_default_number(
+            &db,
+            "IR",
+            &Identity {
+                contact_id: Some(id),
+                ..Default::default()
+            },
+            "+98913",
+            &tg,
+        )
+        .await
+        .unwrap();
+        assert_eq!(st.default_e164.as_deref(), Some("+98913"));
+        assert_eq!(
+            tg.posts.lock().unwrap().as_slice(),
+            &[(9, "default is +98913".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn ignore_by_number_without_topic_skips_telegram() {
+        let db = Db::open_in_memory().unwrap();
+        let tg = crate::app::FakeTg::new();
+        let ignored = ignore(
+            &db,
+            "IR",
+            &Identity {
+                number: Some("09121234567".into()),
+                ..Default::default()
+            },
+            &tg,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ignored, vec!["+989121234567".to_string()]);
+        assert!(tg.posts.lock().unwrap().is_empty());
+        assert!(db.is_ignored("+989121234567").unwrap());
     }
 }

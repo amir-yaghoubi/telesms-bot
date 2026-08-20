@@ -6,13 +6,13 @@ use teloxide::error_handlers::LoggingErrorHandler;
 use teloxide::prelude::*;
 use teloxide::types::{BotCommandScope, CallbackQuery, ChatId, InlineQuery, MessageId, ParseMode};
 
-use crate::actions::{search_contacts, who, ActionError, Identity};
+use crate::actions::{ignore, list_numbers, search_contacts, set_default_number, who, ActionError, Identity};
 use crate::app::{handle_owner_text, send_and_ack, AppError, OwnerTextOutcome, TelegramSink};
 use crate::config::Config;
 use crate::db::{Contact, Db, Topic};
 use crate::modem::SmsModem;
-use crate::normalize::normalize_e164;
 use crate::route::{route_for_send, topic_title, InboundDest, GENERAL_THREAD};
+use crate::normalize::normalize_e164;
 
 use super::keyboards::{
     inline_answer_articles, inline_query_results, number_keyboard, search_keyboard, status_keyboard,
@@ -38,14 +38,6 @@ async fn register_commands(bot: &Bot, group_id: i64) {
         .await;
     if let Err(err) = result {
         tracing::warn!(error = %err, "setMyCommands failed");
-    }
-}
-
-fn topic_numbers(db: &Db, topic: &Topic) -> Result<Vec<String>, AppError> {
-    if let Some(contact_id) = topic.contact_id {
-        Ok(db.contact_numbers(contact_id)?)
-    } else {
-        Ok(topic.default_e164.clone().into_iter().collect())
     }
 }
 
@@ -99,12 +91,25 @@ pub(crate) async fn handle_who(
 
 pub(crate) async fn handle_number_empty_or_list(
     db: &Db,
+    region: &str,
     thread_id: i32,
     tg: &dyn TelegramSink,
 ) -> Result<Vec<String>, AppError> {
     let numbers = match db.get_topic_by_thread(thread_id)? {
-        Some(topic) => topic_numbers(db, &topic)?,
         None => Vec::new(),
+        Some(topic) => {
+            let identity = Identity {
+                contact_id: topic.contact_id,
+                number: topic.default_e164.clone(),
+                thread_id: Some(thread_id),
+            };
+            match list_numbers(db, region, &identity) {
+                Ok(st) => st.numbers,
+                Err(ActionError::NotFound(_)) => Vec::new(),
+                Err(ActionError::Db(e)) => return Err(e.into()),
+                Err(e) => return Err(AppError::Telegram(e.to_string())),
+            }
+        }
     };
     if numbers.is_empty() {
         tg.post(thread_id, "no numbers".to_string()).await?;
@@ -121,8 +126,19 @@ pub(crate) async fn handle_num_callback(
     tg: &dyn TelegramSink,
     delete_enabled: bool,
 ) -> Result<(), AppError> {
-    db.set_default_number(thread_id, e164)?;
-    tg.post(thread_id, format!("default is {e164}")).await?;
+    let Some(topic) = db.get_topic_by_thread(thread_id)? else {
+        return Ok(());
+    };
+    let identity = Identity {
+        number: Some(e164.to_string()),
+        contact_id: topic.contact_id,
+        thread_id: Some(thread_id),
+    };
+    match set_default_number(db, region, &identity, e164, tg).await {
+        Ok(_) => {}
+        Err(ActionError::Db(e)) => return Err(e.into()),
+        Err(e) => return Err(AppError::Telegram(e.to_string())),
+    }
     if let (Some(modem), Some((pending, pending_reply))) =
         (modem, db.take_pending_outbound(thread_id)?)
     {
@@ -236,35 +252,34 @@ pub(crate) async fn handle_ignore(
     reply_text: Option<&str>,
     tg: &dyn TelegramSink,
 ) -> Result<(), AppError> {
-    let mut targets = Vec::new();
-    if thread_id != GENERAL_THREAD {
-        if let Some(topic) = db.get_topic_by_thread(thread_id)? {
-            targets = topic_numbers(db, &topic)?;
-            if targets.is_empty() {
-                if let Some(e164) = topic.default_e164 {
-                    targets.push(e164);
-                }
-            }
+    let identity = if thread_id == GENERAL_THREAD {
+        Identity {
+            number: reply_text.and_then(parse_ignore_reply).map(str::to_string),
+            ..Default::default()
         }
-    } else if let Some(raw) = reply_text.and_then(parse_ignore_reply) {
-        match normalize_e164(raw, region) {
-            Ok(e164) => targets.push(e164),
-            Err(_) => targets.push(raw.to_string()),
+    } else if let Some(topic) = db.get_topic_by_thread(thread_id)? {
+        Identity {
+            contact_id: topic.contact_id,
+            thread_id: Some(thread_id),
+            ..Default::default()
         }
-    }
+    } else {
+        Identity::default()
+    };
 
-    if targets.is_empty() {
-        tg.post(thread_id, "reply to a +number to ignore it".to_string())
+    match ignore(db, region, &identity, tg).await {
+        Ok(_) => Ok(()),
+        Err(ActionError::Validation(_)) if thread_id == GENERAL_THREAD => {
+            tg.post(
+                thread_id,
+                "reply to a +number to ignore it".to_string(),
+            )
             .await?;
-        return Ok(());
+            Ok(())
+        }
+        Err(ActionError::Db(e)) => Err(e.into()),
+        Err(e) => Err(AppError::Telegram(e.to_string())),
     }
-
-    for n in &targets {
-        db.ignore_number(n)?;
-    }
-    tg.post(thread_id, format!("ignored {}", targets.join(", ")))
-        .await?;
-    Ok(())
 }
 
 pub async fn handle_sms(
@@ -503,7 +518,8 @@ async fn on_message(
         Some("help") => handle_help(thread_id, &tg).await?,
         Some("who") => handle_who(&db, &cfg.default_region, thread_id, &tg).await?,
         Some("number") => {
-            let numbers = handle_number_empty_or_list(&db, thread_id, &tg).await?;
+            let numbers =
+                handle_number_empty_or_list(&db, &cfg.default_region, thread_id, &tg).await?;
             if !numbers.is_empty() {
                 send_number_buttons(&bot, tg.chat_id, thread_id, &numbers).await?;
             }

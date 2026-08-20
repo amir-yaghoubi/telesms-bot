@@ -146,7 +146,7 @@ async fn who_in_contact_topic_lists_numbers() {
 async fn number_empty_posts_no_numbers() {
     let db = Db::open_in_memory().unwrap();
     let tg = FakeTg::new();
-    let numbers = handle_number_empty_or_list(&db, 1, &tg).await.unwrap();
+    let numbers = handle_number_empty_or_list(&db, "IR", 1, &tg).await.unwrap();
     assert!(numbers.is_empty());
     assert_eq!(
         tg.posts.lock().unwrap().as_slice(),
@@ -166,7 +166,7 @@ async fn num_callback_sets_default_and_posts() {
     })
     .unwrap();
     let tg = FakeTg::new();
-    handle_num_callback(&db, "IR", 9, "+98913", None, &tg, true)
+    handle_num_callback(&db, "IR", 9, "+98912", None, &tg, true)
         .await
         .unwrap();
     assert_eq!(
@@ -175,11 +175,11 @@ async fn num_callback_sets_default_and_posts() {
             .unwrap()
             .default_e164
             .as_deref(),
-        Some("+98913")
+        Some("+98912")
     );
     assert_eq!(
         tg.posts.lock().unwrap().as_slice(),
-        &[(9, "default is +98913".into())]
+        &[(9, "default is +98912".into())]
     );
 }
 
