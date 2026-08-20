@@ -6,6 +6,8 @@ use futures_util::stream::Stream;
 
 use thiserror::Error;
 
+use crate::call_forward::CallForwardState;
+
 #[derive(Clone, Debug)]
 pub struct IncomingSms {
     pub path: String,
@@ -165,7 +167,13 @@ pub trait ModemInfo: Send + Sync {
     async fn snapshot(&self) -> Result<ModemLive, ModemError>;
 }
 
-#[derive(Default)]
+#[async_trait::async_trait]
+pub trait CallForward: Send + Sync {
+    async fn query_forward(&self, default_region: &str) -> Result<CallForwardState, ModemError>;
+    async fn set_forward(&self, e164: &str, default_region: &str) -> Result<CallForwardState, ModemError>;
+    async fn disable_forward(&self, default_region: &str) -> Result<CallForwardState, ModemError>;
+}
+
 pub struct FakeModem {
     pub sent: Mutex<Vec<(String, String)>>,
     pub deleted: Mutex<Vec<String>>,
@@ -174,6 +182,27 @@ pub struct FakeModem {
     pub(crate) path_seq: AtomicU64,
     pub live: Mutex<Option<ModemLive>>,
     pub listed: Mutex<Vec<IncomingSms>>,
+    pub forward: Mutex<CallForwardState>,
+    pub forward_fail: bool,
+}
+
+impl Default for FakeModem {
+    fn default() -> Self {
+        Self {
+            sent: Mutex::new(Vec::new()),
+            deleted: Mutex::new(Vec::new()),
+            fail: false,
+            delete_fail: false,
+            path_seq: AtomicU64::new(0),
+            live: Mutex::new(None),
+            listed: Mutex::new(Vec::new()),
+            forward: Mutex::new(CallForwardState {
+                enabled: false,
+                e164: None,
+            }),
+            forward_fail: false,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -223,6 +252,42 @@ impl ModemInfo for FakeModem {
             Some(live) => Ok(live),
             None => Err(ModemError::NotFound("fake".into())),
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl CallForward for FakeModem {
+    async fn query_forward(&self, _default_region: &str) -> Result<CallForwardState, ModemError> {
+        if self.forward_fail {
+            return Err(ModemError::Failed("forward fail".into()));
+        }
+        Ok(self.forward.lock().expect("forward lock").clone())
+    }
+
+    async fn set_forward(&self, e164: &str, default_region: &str) -> Result<CallForwardState, ModemError> {
+        if self.forward_fail {
+            return Err(ModemError::Failed("forward fail".into()));
+        }
+        let e164 = crate::normalize::normalize_e164(e164, default_region)
+            .map_err(|e| ModemError::Failed(e.to_string()))?;
+        let st = CallForwardState {
+            enabled: true,
+            e164: Some(e164),
+        };
+        *self.forward.lock().expect("forward lock") = st.clone();
+        Ok(st)
+    }
+
+    async fn disable_forward(&self, _default_region: &str) -> Result<CallForwardState, ModemError> {
+        if self.forward_fail {
+            return Err(ModemError::Failed("forward fail".into()));
+        }
+        let st = CallForwardState {
+            enabled: false,
+            e164: None,
+        };
+        *self.forward.lock().expect("forward lock") = st.clone();
+        Ok(st)
     }
 }
 
@@ -278,5 +343,27 @@ mod tests {
         };
         assert!(m.send("+1", "x").await.is_err());
         assert!(m.deleted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fake_call_forward_set_query_disable() {
+        let m = FakeModem::default();
+        assert!(!m.query_forward("IR").await.unwrap().enabled);
+        let set = m.set_forward("+989121234567", "IR").await.unwrap();
+        assert!(set.enabled);
+        assert_eq!(set.e164.as_deref(), Some("+989121234567"));
+        assert_eq!(m.query_forward("IR").await.unwrap(), set);
+        let off = m.disable_forward("IR").await.unwrap();
+        assert!(!off.enabled);
+        assert!(off.e164.is_none());
+    }
+
+    #[tokio::test]
+    async fn fake_call_forward_fail() {
+        let m = FakeModem {
+            forward_fail: true,
+            ..FakeModem::default()
+        };
+        assert!(m.query_forward("IR").await.is_err());
     }
 }
