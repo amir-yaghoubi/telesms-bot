@@ -3,6 +3,7 @@ pub mod app;
 pub mod config;
 pub mod db;
 pub mod google;
+pub mod http;
 pub mod modem;
 pub mod modem_mm;
 pub mod normalize;
