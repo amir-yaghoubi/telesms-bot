@@ -125,6 +125,28 @@ apt-get update -qq
 apt-get install -y usb-modeswitch modemmanager
 systemctl enable --now ModemManager
 
+# Auto-enable the modem at boot. ModemManager probes the stick but leaves it
+# `disabled`, which breaks SMS until `mmcli --enable` runs by hand.
+install -m 755 "$(dirname "$0")/telesms-modem-enable.sh" /usr/local/bin/telesms-modem-enable
+cat >"/etc/systemd/system/telesms-modem-enable.service" <<'EOF'
+[Unit]
+Description=telesms-bot: enable LTE modem and wait for registration
+Wants=ModemManager.service
+After=ModemManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/telesms-modem-enable
+RemainAfterExit=yes
+TimeoutStartSec=6min
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable telesms-modem-enable.service
+echo "Installed telesms-modem-enable.service (modem auto-enables on boot)."
+
 if [[ -n "$TARGET_USER" ]] && id "$TARGET_USER" >/dev/null 2>&1; then
   usermod -aG dialout "$TARGET_USER"
   echo "Added $TARGET_USER to dialout (log out and back in for AT/qmicli)."

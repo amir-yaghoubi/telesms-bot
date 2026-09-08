@@ -50,7 +50,8 @@ sudo ./scripts/setup-ubuntu-modem.sh
 ```
 
 That installs `usb-modeswitch` and `modemmanager`, enables ModemManager,
-and adds your user to `dialout`.
+installs `telesms-modem-enable.service` (auto-enables and registers the
+modem on every boot), and adds your user to `dialout`.
 
 ### Stable name (recommended)
 
@@ -120,6 +121,11 @@ change if you move the stick to another USB port. Prefer `--uid` + `--usb`.
 ---
 
 ## 3. Enable and register
+
+On hosts installed with `setup-ubuntu-modem.sh`, the
+`telesms-modem-enable.service` oneshot does this automatically at boot
+(check `journalctl -u telesms-modem-enable`). The manual steps below are
+for first bring-up or for hosts without the service.
 
 Wait ~20 s after plug for probe. `mmcli` may show `state: disabled` even
 with a healthy SIM. Listing works as a normal user; **enable** needs
@@ -242,7 +248,7 @@ flowchart TD
     Lsusb -->|Modem VID:PID| MM{mmcli -L?}
     MM -->|Empty| Wait[Restart MM, wait 10s]
     MM -->|Shows modem| State{mmcli state?}
-    State -->|disabled| En[sudo mmcli --enable]
+    State -->|disabled| En[check telesms-modem-enable service, else sudo mmcli --enable]
     State -->|sim-missing / failed| SIM[Reseat SIM]
     State -->|registered| UID{System.device equals MODEM_UID?}
     UID -->|no| Pin[udev UID + restart MM]
@@ -259,7 +265,7 @@ flowchart TD
 | `mmcli -L` empty after `systemctl restart ModemManager` | Wait ~10 s for re-probe |
 | `mmcli -m 0` works, `mmcli -m dwm222` does not | udev UID not applied at probe — restart ModemManager (section 1) |
 | `mmcli -m <uid>` not found, udev has no `ID_MM_PHYSDEV_UID` | Re-run the setup script; `udevadm info` on the USB device |
-| `state: disabled` | `sudo mmcli -m "$MODEM_UID" --enable` |
+| `state: disabled` after boot | `systemctl status telesms-modem-enable`; re-run the setup script if the unit is missing; otherwise `sudo mmcli -m "$MODEM_UID" --enable` |
 | `qmicli`: endpoint hangup | Stop ModemManager or use `--device-open-proxy` |
 | Bot: `modem not found: dwm222` | `MODEM_UID` ≠ `System.device` (still a sysfs path, or typo) |
 

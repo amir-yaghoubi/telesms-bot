@@ -149,9 +149,13 @@ docker compose up -d --build
 - After a big dependency change, a stale cache mount can break the build;
   fix with `docker builder prune` and rebuild.
 - Host reboot: systemd starts Docker after dbus; the container
-  auto-starts. If `mmcli` shows `state: disabled`, enable the modem
-  ([Ubuntu modem setup](ubuntu-modem-setup.md)) and
-  `docker compose restart telesms`.
+  auto-starts. The host's `telesms-modem-enable.service` (installed by
+  [setup-ubuntu-modem.sh](../scripts/setup-ubuntu-modem.sh)) enables and
+  registers the modem in the background, so the bot picks it up as soon as
+  it is `registered` — no manual `mmcli --enable` needed. If `mmcli`
+  still shows `state: disabled` after a few minutes, check
+  `journalctl -u telesms-modem-enable` and
+  [Ubuntu modem setup](ubuntu-modem-setup.md).
 - After you restart ModemManager on the host (UID fix, USB replug),
   restart the container so it does not sit on a stale D-Bus subscribe
   from the probe window.
