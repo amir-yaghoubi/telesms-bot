@@ -69,6 +69,25 @@ and alerts via Telegram if a message does not come back. Run it from cron
 (see the script header). A silent pipeline failure of this class shows up
 as "probe not recorded" instead of nothing.
 
+## Follow-up 2026-09-08 — path collision caused infinite redelivery
+
+The content-only `seen_sms()` fix exposed a schema mismatch:
+`inbound_log.mm_path` is `UNIQUE`, but paths are recycled slot ids after
+every ModemManager restart. A multipart Snapp promo landed on
+`/org/freedesktop/ModemManager1/SMS/27`, a path already held by an
+unrelated Aug 20 row. Per sweep (5 s): `seen_sms` said "new" (content
+differs) → the bot posted to Telegram → `record_inbound` hit
+`UNIQUE(mm_path)` → error → message not deleted → reposted. The message
+was delivered to Telegram every 5 seconds until the next fix.
+
+Fix: `record_inbound()` upserts on `mm_path` conflict
+(`ON CONFLICT DO UPDATE`), refreshing the stale row to the new message.
+The dedup key remains content; the path column now means "the message
+currently associated with this modem slot".
+
+Regression tests: `record_inbound_recycled_path_replaces_stale_row`,
+`incoming_new_message_on_recycled_path_delivers_once_and_deletes`.
+
 ## Unrelated finding — Google token revoked
 
 Contacts sync has been failing since 2026-09-07 with

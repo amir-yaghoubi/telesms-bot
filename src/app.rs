@@ -1245,6 +1245,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incoming_new_message_on_recycled_path_delivers_once_and_deletes() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db.upsert_contact("people/a", "Ali").unwrap();
+        db.replace_contact_numbers(id, &["+989121234567".into()])
+            .unwrap();
+        // Stale row holds the modem path from before a ModemManager restart.
+        db.record_inbound(
+            "/sms/1",
+            "+989199999999",
+            "old promo",
+            None,
+            "2026-08-20T22:45:37+03:30",
+            42,
+        )
+        .unwrap();
+        let tg = FakeTg::new();
+        let modem = FakeModem::default();
+        let sms = IncomingSms {
+            path: "/sms/1".into(),
+            e164: "+989121234567".into(),
+            text: "fresh message".into(),
+            inbound: true,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+        handle_incoming_then_delete(&db, "IR", sms.clone(), &tg, &modem, true)
+            .await
+            .unwrap();
+        assert_eq!(tg.posts.lock().unwrap().len(), 1);
+        assert_eq!(
+            modem.deleted.lock().unwrap().as_slice(),
+            &["/sms/1".into()] as &[String]
+        );
+        // A later sweep sees the same message again: deduped, no repost.
+        handle_incoming_then_delete(&db, "IR", sms, &tg, &modem, true)
+            .await
+            .unwrap();
+        assert_eq!(tg.posts.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn incoming_stale_skip_deletes() {
         let db = Db::open_in_memory().unwrap();
         let tg = FakeTg::new();

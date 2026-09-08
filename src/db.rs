@@ -605,6 +605,11 @@ impl Db {
         Ok(())
     }
 
+    /// Record an inbound message. mm_path is a recycled ModemManager slot
+    /// id (renumbered from 0 at every restart), so a stale row may already
+    /// hold the path for an unrelated older message; on conflict the row is
+    /// refreshed to the new message. Dedup itself is content-based via
+    /// `seen_sms`.
     pub fn record_inbound(
         &self,
         path: &str,
@@ -617,7 +622,14 @@ impl Db {
         let conn = self.conn()?;
         conn.execute(
             "INSERT INTO inbound_log (mm_path, e164, body, tg_msg, created_at, sms_ts, thread_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(mm_path) DO UPDATE SET
+               e164 = excluded.e164,
+               body = excluded.body,
+               tg_msg = excluded.tg_msg,
+               created_at = excluded.created_at,
+               sms_ts = excluded.sms_ts,
+               thread_id = excluded.thread_id",
             rusqlite::params![path, e164, text, tg_msg, Self::now(), sms_ts, thread_id],
         )?;
         Ok(())
@@ -1121,6 +1133,40 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tid, 42);
+    }
+
+    #[test]
+    fn record_inbound_recycled_path_replaces_stale_row() {
+        let db = Db::open_in_memory().unwrap();
+        // Weeks ago a message was logged on this ModemManager path.
+        db.record_inbound(
+            "/org/freedesktop/ModemManager1/SMS/27",
+            "+989188086139",
+            "هی bruh",
+            None,
+            "2026-08-20T22:45:37+03:30",
+            1,
+        )
+        .unwrap();
+        // After a ModemManager restart the path is recycled for a new,
+        // unrelated message; recording it must succeed, not hit UNIQUE.
+        db.record_inbound(
+            "/org/freedesktop/ModemManager1/SMS/27",
+            "+989900000000",
+            "fresh promo",
+            None,
+            "2026-09-08T13:21:01+03:30",
+            1,
+        )
+        .unwrap();
+        assert!(db
+            .seen_sms(
+                "/org/freedesktop/ModemManager1/SMS/27",
+                "+989900000000",
+                "fresh promo",
+                "2026-09-08T13:21:01+03:30",
+            )
+            .unwrap());
     }
 
     #[test]
