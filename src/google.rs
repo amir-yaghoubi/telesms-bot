@@ -17,15 +17,28 @@ use crate::normalize::normalize_e164;
 pub const CONTACTS_SCOPE: &str = "https://www.googleapis.com/auth/contacts.readonly";
 pub const REDIRECT_URI: &str = "http://127.0.0.1:8765/";
 
-async fn ensure_success(resp: reqwest::Response) -> Result<reqwest::Response, GoogleError> {
+fn classify_people_status(status: u16, url: &str, snippet: &str) -> GoogleError {
+    if status >= 500 || status == 429 {
+        GoogleError::Transient(format!("people api {status} {url} {snippet}"))
+    } else if status == 401 {
+        GoogleError::Auth(format!("people api {status} {url} {snippet}"))
+    } else {
+        GoogleError::Other(format!("people api {status} {url} {snippet}"))
+    }
+}
+
+async fn ensure_people_success(resp: reqwest::Response) -> Result<reqwest::Response, GoogleError> {
     let status = resp.status();
     if status.is_success() {
         return Ok(resp);
     }
-    let url = resp.url().clone();
+    let url = resp.url().to_string();
     let body = resp.text().await.unwrap_or_default();
-    let snippet: String = body.chars().take(500).collect();
-    Err(GoogleError::Other(format!("{status} {url} {snippet}")))
+    Err(classify_people_status(
+        status.as_u16(),
+        &url,
+        &snippet(&body),
+    ))
 }
 
 fn snippet(body: &str) -> String {
@@ -162,6 +175,12 @@ impl GooglePeople {
         }
     }
 
+    fn invalidate_cached_token(&self) {
+        if let Ok(mut guard) = self.cached.lock() {
+            *guard = None;
+        }
+    }
+
     pub async fn access_token(&self) -> Result<String, GoogleError> {
         if let Some(token) = self.cached_token() {
             return Ok(token);
@@ -196,18 +215,38 @@ impl GooglePeople {
 
     pub async fn sync_all(&self, db: &Db, region: &str) -> Result<usize, GoogleError> {
         let token = self.access_token().await?;
+        match self.fetch_all_pages(&token, region).await {
+            Err(GoogleError::Auth(_)) => {
+                self.invalidate_cached_token();
+                let token = self.access_token().await?;
+                let all = self.fetch_all_pages(&token, region).await?;
+                sync_parsed(db, all)
+            }
+            result => {
+                let all = result?;
+                sync_parsed(db, all)
+            }
+        }
+    }
+
+    async fn fetch_all_pages(
+        &self,
+        token: &str,
+        region: &str,
+    ) -> Result<Vec<ParsedContact>, GoogleError> {
         let mut page_token: Option<String> = None;
         let mut all = Vec::new();
         loop {
             let mut req = self
                 .client
                 .get("https://people.googleapis.com/v1/people/me/connections")
-                .bearer_auth(&token)
+                .bearer_auth(token)
                 .query(&[("personFields", "names,phoneNumbers"), ("pageSize", "1000")]);
             if let Some(pt) = &page_token {
                 req = req.query(&[("pageToken", pt.as_str())]);
             }
-            let resp = ensure_success(req.send().await?).await?;
+            let resp =
+                ensure_people_success(req.send().await.map_err(classify_send_err)?).await?;
             let body = resp.text().await?;
             let (page, next) = parse_people_page(&body, region)?;
             all.extend(page);
@@ -216,7 +255,19 @@ impl GooglePeople {
                 _ => break,
             }
         }
-        sync_parsed(db, all)
+        Ok(all)
+    }
+}
+
+#[async_trait::async_trait]
+pub trait ContactsSync: Send + Sync {
+    async fn sync_all(&self, db: &Db, region: &str) -> Result<usize, GoogleError>;
+}
+
+#[async_trait::async_trait]
+impl ContactsSync for GooglePeople {
+    async fn sync_all(&self, db: &Db, region: &str) -> Result<usize, GoogleError> {
+        GooglePeople::sync_all(self, db, region).await
     }
 }
 
@@ -500,6 +551,40 @@ mod tests {
         people.store_cached_token("stale-token", 0);
         assert!(matches!(
             people.access_token().await,
+            Err(GoogleError::Auth(_))
+        ));
+    }
+
+    #[test]
+    fn classifies_people_api_failures() {
+        assert!(matches!(
+            classify_people_status(503, "u", "s"),
+            GoogleError::Transient(_)
+        ));
+        assert!(matches!(
+            classify_people_status(429, "u", "s"),
+            GoogleError::Transient(_)
+        ));
+        assert!(matches!(
+            classify_people_status(401, "u", "s"),
+            GoogleError::Auth(_)
+        ));
+        assert!(matches!(
+            classify_people_status(400, "u", "s"),
+            GoogleError::Other(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn google_people_impls_contacts_sync() {
+        let syncer: std::sync::Arc<dyn ContactsSync> = std::sync::Arc::new(GooglePeople::new(
+            PathBuf::from("/nonexistent/google-token.json"),
+            "cid".into(),
+            "sec".into(),
+        ));
+        let db = Db::open_in_memory().unwrap();
+        assert!(matches!(
+            syncer.sync_all(&db, "IR").await,
             Err(GoogleError::Auth(_))
         ));
     }
