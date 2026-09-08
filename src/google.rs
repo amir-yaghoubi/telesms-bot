@@ -52,7 +52,7 @@ fn classify_token_failure(status: u16, body: &str) -> GoogleError {
     {
         GoogleError::Auth(format!("token endpoint {status} {}", snippet(body)))
     } else if status >= 500 {
-        GoogleError::Transient(format!("token endpoint {status}"))
+        GoogleError::Transient(format!("token endpoint {status} {}", snippet(body)))
     } else {
         GoogleError::Other(format!("token endpoint {status} {}", snippet(body)))
     }
