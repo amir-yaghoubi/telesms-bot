@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use oauth2::basic::BasicClient;
 use oauth2::{
@@ -75,6 +76,7 @@ pub struct GooglePeople {
     token_path: PathBuf,
     client_id: String,
     client_secret: String,
+    cached: Mutex<Option<CachedToken>>,
 }
 
 #[derive(Deserialize)]
@@ -111,9 +113,22 @@ struct StoredToken {
     refresh_token: String,
 }
 
+struct CachedToken {
+    token: String,
+    expires_at: Instant,
+}
+
+const TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(300);
+
+fn token_fresh(cached: &CachedToken, now: Instant) -> bool {
+    cached.expires_at > now + TOKEN_REFRESH_MARGIN
+}
+
 #[derive(Deserialize)]
 struct RefreshResponse {
     access_token: String,
+    #[serde(default)]
+    expires_in: Option<u64>,
 }
 
 type ParsedContact = (String, String, Vec<String>);
@@ -128,10 +143,29 @@ impl GooglePeople {
             token_path,
             client_id,
             client_secret,
+            cached: Mutex::new(None),
+        }
+    }
+
+    fn cached_token(&self) -> Option<String> {
+        let guard = self.cached.lock().ok()?;
+        let cached = guard.as_ref()?;
+        token_fresh(cached, Instant::now()).then(|| cached.token.clone())
+    }
+
+    fn store_cached_token(&self, token: &str, expires_in: u64) {
+        if let Ok(mut guard) = self.cached.lock() {
+            *guard = Some(CachedToken {
+                token: token.to_string(),
+                expires_at: Instant::now() + Duration::from_secs(expires_in),
+            });
         }
     }
 
     pub async fn access_token(&self) -> Result<String, GoogleError> {
+        if let Some(token) = self.cached_token() {
+            return Ok(token);
+        }
         let raw = tokio::fs::read_to_string(&self.token_path)
             .await
             .map_err(|e| GoogleError::Auth(format!("token file unreadable: {e}")))?;
@@ -155,6 +189,8 @@ impl GooglePeople {
             return Err(classify_token_failure(status.as_u16(), &body));
         }
         let body: RefreshResponse = resp.json().await?;
+        let expires_in = body.expires_in.unwrap_or(3600);
+        self.store_cached_token(&body.access_token, expires_in);
         Ok(body.access_token)
     }
 
@@ -422,6 +458,46 @@ mod tests {
             "cid".into(),
             "sec".into(),
         );
+        assert!(matches!(
+            people.access_token().await,
+            Err(GoogleError::Auth(_))
+        ));
+    }
+
+    #[test]
+    fn token_fresh_respects_margin() {
+        let now = Instant::now();
+        let fresh = CachedToken {
+            token: "a".into(),
+            expires_at: now + Duration::from_secs(600),
+        };
+        let stale = CachedToken {
+            token: "a".into(),
+            expires_at: now + Duration::from_secs(60),
+        };
+        assert!(token_fresh(&fresh, now));
+        assert!(!token_fresh(&stale, now));
+    }
+
+    #[tokio::test]
+    async fn cached_token_short_circuits_refresh() {
+        let people = GooglePeople::new(
+            PathBuf::from("/nonexistent/google-token.json"),
+            "cid".into(),
+            "sec".into(),
+        );
+        people.store_cached_token("cached-token", 3600);
+        assert_eq!(people.access_token().await.unwrap(), "cached-token");
+    }
+
+    #[tokio::test]
+    async fn stale_cached_token_is_not_used() {
+        let people = GooglePeople::new(
+            PathBuf::from("/nonexistent/google-token.json"),
+            "cid".into(),
+            "sec".into(),
+        );
+        people.store_cached_token("stale-token", 0);
         assert!(matches!(
             people.access_token().await,
             Err(GoogleError::Auth(_))
