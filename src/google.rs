@@ -27,6 +27,31 @@ async fn ensure_success(resp: reqwest::Response) -> Result<reqwest::Response, Go
     Err(GoogleError::Other(format!("{status} {url} {snippet}")))
 }
 
+fn snippet(body: &str) -> String {
+    body.chars().take(200).collect()
+}
+
+fn classify_token_failure(status: u16, body: &str) -> GoogleError {
+    let lowered = body.to_ascii_lowercase();
+    if (status == 400 || status == 401)
+        && (lowered.contains("invalid_grant") || lowered.contains("invalid_client"))
+    {
+        GoogleError::Auth(format!("token endpoint {status} {}", snippet(body)))
+    } else if status >= 500 {
+        GoogleError::Transient(format!("token endpoint {status}"))
+    } else {
+        GoogleError::Other(format!("token endpoint {status} {}", snippet(body)))
+    }
+}
+
+fn classify_send_err(err: reqwest::Error) -> GoogleError {
+    if err.is_timeout() || err.is_connect() {
+        GoogleError::Transient(err.to_string())
+    } else {
+        GoogleError::Http(err)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum GoogleError {
     #[error("io: {0}")]
@@ -37,6 +62,10 @@ pub enum GoogleError {
     Http(#[from] reqwest::Error),
     #[error("db: {0}")]
     Db(#[from] crate::db::DbError),
+    #[error("google auth: {0}")]
+    Auth(String),
+    #[error("transient: {0}")]
+    Transient(String),
     #[error("{0}")]
     Other(String),
 }
@@ -103,8 +132,11 @@ impl GooglePeople {
     }
 
     pub async fn access_token(&self) -> Result<String, GoogleError> {
-        let raw = tokio::fs::read_to_string(&self.token_path).await?;
-        let stored: StoredToken = serde_json::from_str(&raw)?;
+        let raw = tokio::fs::read_to_string(&self.token_path)
+            .await
+            .map_err(|e| GoogleError::Auth(format!("token file unreadable: {e}")))?;
+        let stored: StoredToken = serde_json::from_str(&raw)
+            .map_err(|e| GoogleError::Auth(format!("token file unparsable: {e}")))?;
         let resp = self
             .client
             .post("https://oauth2.googleapis.com/token")
@@ -115,8 +147,13 @@ impl GooglePeople {
                 ("grant_type", "refresh_token"),
             ])
             .send()
-            .await?;
-        let resp = ensure_success(resp).await?;
+            .await
+            .map_err(classify_send_err)?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(classify_token_failure(status.as_u16(), &body));
+        }
         let body: RefreshResponse = resp.json().await?;
         Ok(body.access_token)
     }
@@ -356,5 +393,38 @@ mod tests {
             CONTACTS_SCOPE,
             "https://www.googleapis.com/auth/contacts.readonly"
         );
+    }
+
+    #[test]
+    fn classifies_token_endpoint_failures() {
+        assert!(matches!(
+            classify_token_failure(400, r#"{"error":"invalid_grant"}"#),
+            GoogleError::Auth(_)
+        ));
+        assert!(matches!(
+            classify_token_failure(401, r#"{"error":"invalid_client"}"#),
+            GoogleError::Auth(_)
+        ));
+        assert!(matches!(
+            classify_token_failure(500, "server error"),
+            GoogleError::Transient(_)
+        ));
+        assert!(matches!(
+            classify_token_failure(403, "forbidden"),
+            GoogleError::Other(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn missing_token_file_is_auth_error() {
+        let people = GooglePeople::new(
+            PathBuf::from("/nonexistent/google-token.json"),
+            "cid".into(),
+            "sec".into(),
+        );
+        assert!(matches!(
+            people.access_token().await,
+            Err(GoogleError::Auth(_))
+        ));
     }
 }
