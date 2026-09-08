@@ -569,18 +569,18 @@ impl Db {
         Ok(found.is_some())
     }
 
-    /// D-Bus SMS paths change when ModemManager reloads the inbox.
-    /// Number + body + modem timestamp is stable across those reloads.
+    /// Dedup key is the message content: number + body + modem timestamp.
+    /// D-Bus SMS paths change when ModemManager reloads the inbox and are
+    /// REUSED from low numbers after every ModemManager restart, so a path
+    /// match may refer to an unrelated message seen weeks earlier; matching
+    /// by path silently drops every new SMS after a reboot.
     pub fn seen_sms(
         &self,
-        path: &str,
+        _path: &str,
         e164: &str,
         text: &str,
         sms_ts: &str,
     ) -> Result<bool, DbError> {
-        if self.seen_sms_path(path)? {
-            return Ok(true);
-        }
         if sms_ts.is_empty() {
             return Ok(false);
         }
@@ -944,7 +944,34 @@ mod tests {
         db.record_inbound("/sms/1", "+98912", "hi", None, "", 1)
             .unwrap();
         assert!(db.seen_sms_path("/sms/1").unwrap());
-        assert!(db.seen_sms("/sms/1", "+98912", "hi", "").unwrap());
+        // Path alone must never mark a message seen: ModemManager reuses
+        // low path numbers after every restart, so a path match may refer
+        // to a completely different message seen weeks earlier.
+        assert!(!db.seen_sms("/sms/1", "+98912", "hi", "").unwrap());
+    }
+
+    #[test]
+    fn seen_sms_path_reuse_after_mm_restart_is_not_seen() {
+        let db = Db::open_in_memory().unwrap();
+        db.record_inbound(
+            "/org/freedesktop/ModemManager1/SMS/17",
+            "+989999987641",
+            "old promo from weeks ago",
+            None,
+            "2026-08-20T15:42:30+00:00",
+            1,
+        )
+        .unwrap();
+        // After a host reboot ModemManager restarts numbering at SMS/0 and
+        // the new message lands on a path that already exists in the log.
+        assert!(!db
+            .seen_sms(
+                "/org/freedesktop/ModemManager1/SMS/17",
+                "+989120000000",
+                "fresh otp 1234",
+                "2026-09-08T08:00:00+00:00",
+            )
+            .unwrap());
     }
 
     #[test]
@@ -968,12 +995,12 @@ mod tests {
     }
 
     #[test]
-    fn seen_sms_empty_ts_does_not_content_match() {
+    fn seen_sms_empty_ts_is_never_seen() {
         let db = Db::open_in_memory().unwrap();
         db.record_inbound("/sms/1", "+98912", "hi", None, "", 1)
             .unwrap();
+        assert!(!db.seen_sms("/sms/1", "+98912", "hi", "").unwrap());
         assert!(!db.seen_sms("/sms/2", "+98912", "hi", "").unwrap());
-        assert!(db.seen_sms("/sms/1", "+98912", "hi", "").unwrap());
     }
 
     #[test]

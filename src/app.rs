@@ -392,6 +392,11 @@ pub enum SweepAction {
     Delete,
 }
 
+/// Inbound messages whose text is still empty after this long are
+/// incomplete multipart SMS whose remaining parts will never arrive;
+/// they block SIM storage slots forever if not removed.
+pub const STUCK_RECEIVING_MAX: Duration = Duration::from_secs(6 * 3600);
+
 fn sms_age_duration(ts: &str, now: chrono::DateTime<chrono::Utc>) -> Option<Duration> {
     let dt = parse_sms_timestamp(ts)?;
     let delta = now.signed_duration_since(dt.with_timezone(&chrono::Utc));
@@ -408,6 +413,13 @@ pub fn sweep_action(
 ) -> SweepAction {
     let age = sms_age_duration(&sms.timestamp, now);
     if sms.inbound && !seen {
+        if sms.text.is_empty() {
+            return match age {
+                None => SweepAction::Keep,
+                Some(age) if age > STUCK_RECEIVING_MAX => SweepAction::Delete,
+                Some(_) => SweepAction::Keep,
+            };
+        }
         return match age {
             None => SweepAction::Keep,
             Some(age) if age < inbound_retry_window => SweepAction::Keep,
@@ -1381,6 +1393,16 @@ mod tests {
         }
     }
 
+    fn sweep_stuck_sms(ts: &str) -> IncomingSms {
+        IncomingSms {
+            path: "/sms/x".into(),
+            e164: "Ewano".into(),
+            text: String::new(),
+            inbound: true,
+            timestamp: ts.into(),
+        }
+    }
+
     #[test]
     fn sweep_action_table() {
         let now = sweep_now();
@@ -1438,6 +1460,24 @@ mod tests {
             (
                 "outbound 1h",
                 sweep_sms(false, "2026-08-19T11:00:00+00:00"),
+                false,
+                SweepAction::Keep,
+            ),
+            (
+                "stuck receiving 7h",
+                sweep_stuck_sms("2026-08-19T05:00:00+00:00"),
+                false,
+                SweepAction::Delete,
+            ),
+            (
+                "stuck receiving 1h",
+                sweep_stuck_sms("2026-08-19T11:00:00+00:00"),
+                false,
+                SweepAction::Keep,
+            ),
+            (
+                "stuck receiving no ts",
+                sweep_stuck_sms(""),
                 false,
                 SweepAction::Keep,
             ),
