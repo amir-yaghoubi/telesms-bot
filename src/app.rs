@@ -7,6 +7,7 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::db::{Db, Topic};
+use crate::google::{ContactsSync, GoogleError};
 use crate::modem::{IncomingSms, ModemError, ModemInfo, SmsInbox, SmsModem};
 use crate::actions::ActionError;
 use crate::modem_mm::MmModem;
@@ -73,6 +74,132 @@ pub async fn watch_modem(
         tokio::select! {
             _ = cancel.cancelled() => return,
             _ = tokio::time::sleep(interval) => {}
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncOutcome {
+    Ok,
+    Degraded,
+    Auth,
+}
+
+pub async fn sync_with_retries(
+    syncer: &dyn ContactsSync,
+    db: &Db,
+    region: &str,
+    retry_waits: &[Duration],
+) -> SyncOutcome {
+    let mut attempt = 0;
+    loop {
+        match syncer.sync_all(db, region).await {
+            Ok(n) => {
+                tracing::info!(contacts = n, "google contacts synced");
+                return SyncOutcome::Ok;
+            }
+            Err(GoogleError::Auth(err)) => {
+                tracing::error!(error = %err, "google contacts token rejected");
+                return SyncOutcome::Auth;
+            }
+            Err(GoogleError::Transient(err)) => {
+                if attempt >= retry_waits.len() {
+                    tracing::warn!(error = %err, "google contacts sync failed after retries");
+                    return SyncOutcome::Degraded;
+                }
+                let wait = retry_waits[attempt];
+                attempt += 1;
+                tracing::warn!(
+                    error = %err,
+                    wait_secs = wait.as_secs(),
+                    "google contacts sync failed, retrying"
+                );
+                tokio::time::sleep(wait).await;
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "google contacts sync failed");
+                return SyncOutcome::Degraded;
+            }
+        }
+    }
+}
+
+async fn sync_once(
+    syncer: &dyn ContactsSync,
+    db: &Db,
+    region: &str,
+    tg: &dyn TelegramSink,
+    retry_waits: &[Duration],
+    presence: &mut Presence,
+) {
+    let outcome = sync_with_retries(syncer, db, region, retry_waits).await;
+    match outcome {
+        SyncOutcome::Ok => {
+            db.set_contacts_available(true);
+        }
+        SyncOutcome::Degraded => {
+            tracing::warn!("google contacts degraded; keeping last known contacts");
+        }
+        SyncOutcome::Auth => {
+            db.set_contacts_available(false);
+        }
+    }
+    let available = match outcome {
+        SyncOutcome::Ok => Some(true),
+        SyncOutcome::Auth => Some(false),
+        SyncOutcome::Degraded => None,
+    };
+    if let Some(available) = available {
+        let text = match presence.observe(available) {
+            Some(PresenceEvent::Offline) => {
+                Some("⚠️ Google contacts token dead — run cargo run -- auth")
+            }
+            Some(PresenceEvent::Back) => Some("google contacts back"),
+            None => None,
+        };
+        if let Some(text) = text {
+            if let Err(err) = tg.post(GENERAL_THREAD, text.to_string()).await {
+                tracing::error!(error = %err, "failed to post contacts health");
+            }
+        }
+    }
+}
+
+pub async fn watch_contacts(
+    syncer: Arc<dyn ContactsSync>,
+    db: Arc<Db>,
+    region: String,
+    tg: Arc<dyn TelegramSink>,
+    interval: Duration,
+    retry_waits: Vec<Duration>,
+    cancel: CancellationToken,
+) {
+    let mut presence = Presence::new();
+    sync_once(
+        syncer.as_ref(),
+        &db,
+        &region,
+        tg.as_ref(),
+        &retry_waits,
+        &mut presence,
+    )
+    .await;
+    let mut ticker = tokio::time::interval(interval);
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = ticker.tick() => {
+                sync_once(
+                    syncer.as_ref(),
+                    &db,
+                    &region,
+                    tg.as_ref(),
+                    &retry_waits,
+                    &mut presence,
+                )
+                .await;
+            }
         }
     }
 }
@@ -637,6 +764,8 @@ mod tests {
     use super::*;
     use crate::db::Db;
     use crate::modem::FakeModem;
+    use std::collections::VecDeque;
+    use std::sync::atomic::AtomicUsize;
 
     #[tokio::test]
     async fn incoming_known_contact_creates_topic_and_posts_body() {
@@ -1512,5 +1641,210 @@ mod tests {
             ),
             SweepAction::Delete
         );
+    }
+
+    #[derive(Clone)]
+    enum FakeResult {
+        Ok(usize),
+        Transient,
+        Auth,
+        Json,
+    }
+
+    struct FakeSync {
+        results: Mutex<VecDeque<FakeResult>>,
+        calls: AtomicUsize,
+    }
+
+    impl FakeSync {
+        fn new(results: Vec<FakeResult>) -> Self {
+            Self {
+                results: Mutex::new(results.into()),
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ContactsSync for FakeSync {
+        async fn sync_all(&self, _db: &Db, _region: &str) -> Result<usize, GoogleError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut guard = self.results.lock().unwrap();
+            if guard.is_empty() {
+                return Ok(0);
+            }
+            let result = guard.front().unwrap().clone();
+            if guard.len() > 1 {
+                guard.pop_front();
+            }
+            match result {
+                FakeResult::Ok(n) => Ok(n),
+                FakeResult::Transient => Err(GoogleError::Transient("boom".into())),
+                FakeResult::Auth => Err(GoogleError::Auth("dead".into())),
+                FakeResult::Json => Err(GoogleError::Json(
+                    serde_json::from_str::<serde_json::Value>("not json").unwrap_err(),
+                )),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_retries_transient_then_degrades() {
+        let syncer = FakeSync::new(vec![FakeResult::Transient; 3]);
+        let db = Db::open_in_memory().unwrap();
+        let outcome = sync_with_retries(
+            &syncer,
+            &db,
+            "IR",
+            &[Duration::from_millis(1), Duration::from_millis(1)],
+        )
+        .await;
+        assert_eq!(outcome, SyncOutcome::Degraded);
+        assert_eq!(syncer.calls(), 3);
+        assert!(db.contacts_available());
+    }
+
+    #[tokio::test]
+    async fn sync_retries_transient_then_succeeds() {
+        let syncer = FakeSync::new(vec![
+            FakeResult::Transient,
+            FakeResult::Transient,
+            FakeResult::Ok(7),
+        ]);
+        let db = Db::open_in_memory().unwrap();
+        let outcome = sync_with_retries(
+            &syncer,
+            &db,
+            "IR",
+            &[Duration::from_millis(1), Duration::from_millis(1)],
+        )
+        .await;
+        assert_eq!(outcome, SyncOutcome::Ok);
+        assert_eq!(syncer.calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn sync_auth_fails_fast_without_retry() {
+        let syncer = FakeSync::new(vec![FakeResult::Auth]);
+        let db = Db::open_in_memory().unwrap();
+        let outcome = sync_with_retries(
+            &syncer,
+            &db,
+            "IR",
+            &[Duration::from_millis(1), Duration::from_millis(1)],
+        )
+        .await;
+        assert_eq!(outcome, SyncOutcome::Auth);
+        assert_eq!(syncer.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn sync_other_errors_degrade_without_retry() {
+        let syncer = FakeSync::new(vec![FakeResult::Json]);
+        let db = Db::open_in_memory().unwrap();
+        let outcome = sync_with_retries(
+            &syncer,
+            &db,
+            "IR",
+            &[Duration::from_millis(1), Duration::from_millis(1)],
+        )
+        .await;
+        assert_eq!(outcome, SyncOutcome::Degraded);
+        assert_eq!(syncer.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn watch_contacts_alerts_once_on_token_death() {
+        let syncer: Arc<dyn ContactsSync> = Arc::new(FakeSync::new(vec![FakeResult::Auth]));
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let tg = Arc::new(FakeTg::new());
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(watch_contacts(
+            syncer,
+            db.clone(),
+            "IR".into(),
+            tg.clone(),
+            Duration::from_millis(15),
+            vec![Duration::from_millis(1), Duration::from_millis(1)],
+            cancel.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("watch_contacts did not stop")
+            .expect("watch_contacts join");
+        assert!(!db.contacts_available());
+        assert_eq!(
+            tg.posts.lock().unwrap().as_slice(),
+            &[(
+                GENERAL_THREAD,
+                "⚠️ Google contacts token dead — run cargo run -- auth".into()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_contacts_alerts_recovery_once() {
+        let syncer: Arc<dyn ContactsSync> =
+            Arc::new(FakeSync::new(vec![FakeResult::Auth, FakeResult::Ok(5)]));
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let tg = Arc::new(FakeTg::new());
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(watch_contacts(
+            syncer,
+            db.clone(),
+            "IR".into(),
+            tg.clone(),
+            Duration::from_millis(15),
+            vec![Duration::from_millis(1), Duration::from_millis(1)],
+            cancel.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("watch_contacts did not stop")
+            .expect("watch_contacts join");
+        assert!(db.contacts_available());
+        assert_eq!(
+            tg.posts.lock().unwrap().as_slice(),
+            &[
+                (
+                    GENERAL_THREAD,
+                    "⚠️ Google contacts token dead — run cargo run -- auth".into()
+                ),
+                (GENERAL_THREAD, "google contacts back".into()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_contacts_transient_keeps_available_and_silent() {
+        let syncer: Arc<dyn ContactsSync> = Arc::new(FakeSync::new(vec![FakeResult::Transient]));
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let tg = Arc::new(FakeTg::new());
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(watch_contacts(
+            syncer,
+            db.clone(),
+            "IR".into(),
+            tg.clone(),
+            Duration::from_millis(15),
+            vec![Duration::from_millis(1), Duration::from_millis(1)],
+            cancel.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("watch_contacts did not stop")
+            .expect("watch_contacts join");
+        assert!(db.contacts_available());
+        assert!(tg.posts.lock().unwrap().is_empty());
     }
 }
