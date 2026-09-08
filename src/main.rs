@@ -6,10 +6,10 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
-use telesms_bot::app::{sweep_old_sms, watch_inbox, watch_modem, TelegramSink};
+use telesms_bot::app::{sweep_old_sms, watch_contacts, watch_inbox, watch_modem, TelegramSink};
 use telesms_bot::config::Config;
 use telesms_bot::db::Db;
-use telesms_bot::google::GooglePeople;
+use telesms_bot::google::{ContactsSync, GooglePeople};
 use telesms_bot::modem::{CallForward, SmsModem};
 use telesms_bot::modem_mm::MmModem;
 use telesms_bot::telegram::{self, RealTg};
@@ -62,11 +62,16 @@ async fn run_daemon() {
     let db = Arc::new(Db::open(&cfg.database_path).expect("db"));
     let cancel = CancellationToken::new();
 
-    let people = Arc::new(GooglePeople::new(
+    let people: Arc<dyn ContactsSync> = Arc::new(GooglePeople::new(
         cfg.google_token_path.clone(),
         cfg.google_client_id.clone(),
         cfg.google_client_secret.clone(),
     ));
+
+    let tg: Arc<dyn TelegramSink> = Arc::new(RealTg {
+        bot: teloxide::Bot::new(cfg.telegram_bot_token.clone()),
+        chat_id: ChatId(cfg.telegram_group_id),
+    });
 
     let mut tasks = JoinSet::new();
 
@@ -74,19 +79,15 @@ async fn run_daemon() {
     let region_sync = cfg.default_region.clone();
     let sync_every = cfg.contacts_sync_interval;
     let cancel_sync = cancel.clone();
-    tasks.spawn(async move {
-        sync_contacts(&people, &db_sync, &region_sync).await;
-        let mut ticker = tokio::time::interval(sync_every);
-        ticker.tick().await;
-        loop {
-            tokio::select! {
-                _ = cancel_sync.cancelled() => return,
-                _ = ticker.tick() => {
-                    sync_contacts(&people, &db_sync, &region_sync).await;
-                }
-            }
-        }
-    });
+    tasks.spawn(watch_contacts(
+        people,
+        db_sync,
+        region_sync,
+        tg.clone(),
+        sync_every,
+        vec![Duration::from_secs(30), Duration::from_secs(120)],
+        cancel_sync,
+    ));
 
     let mm = Arc::new(
         MmModem::connect_with_uid(cfg.modem_uid.clone())
@@ -94,11 +95,6 @@ async fn run_daemon() {
             .expect("modemmanager dbus"),
     );
     let modem: Arc<dyn SmsModem> = mm.clone();
-
-    let tg: Arc<dyn TelegramSink> = Arc::new(RealTg {
-        bot: teloxide::Bot::new(cfg.telegram_bot_token.clone()),
-        chat_id: ChatId(cfg.telegram_group_id),
-    });
 
     let db_in = db.clone();
     let region_in = cfg.default_region.clone();
@@ -173,15 +169,3 @@ async fn run_daemon() {
     .await;
 }
 
-async fn sync_contacts(people: &GooglePeople, db: &Db, region: &str) {
-    match people.sync_all(db, region).await {
-        Ok(n) => {
-            tracing::info!(contacts = n, "google contacts synced");
-            db.set_contacts_available(true);
-        }
-        Err(err) => {
-            tracing::error!(error = %err, "google contacts sync failed");
-            db.set_contacts_available(false);
-        }
-    }
-}

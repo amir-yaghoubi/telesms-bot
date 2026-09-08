@@ -145,9 +145,16 @@ UID. Do **not** run ModemManager inside Docker. On Ubuntu, Compose sets
 2. Copy `.env.example` → `.env`. Fill the bot token, your Telegram user
    id, and the group id (`-100…`).
 3. **Google Cloud** — OAuth desktop client with Contacts readonly. Put
-   the client id and secret in `.env`.
+   the client id and secret in `.env`. **Publish the OAuth consent
+   screen** (APIs & Services → OAuth consent screen → *Publish App*):
+   in Testing mode Google hard-expires refresh tokens after 7 days, in
+   Production mode they last indefinitely. A personal app needs no
+   verification review; re-consenting may show an "unverified app"
+   warning you can accept.
 4. `cargo run -- auth` writes `./secrets/google-token.json` (needs a
-   browser).
+   browser). If an older token was minted while the app was in Testing
+   mode, re-run this once after publishing so the refresh token no
+   longer carries the 7-day expiry.
 5. Stick **registered**: [Ubuntu modem setup](docs/ubuntu-modem-setup.md).
 6. `RUST_LOG=info cargo run`
 7. In General: `/sms 09… hello`. Confirm the phone and a Telegram ✓.
