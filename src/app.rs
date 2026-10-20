@@ -563,7 +563,16 @@ fn announce_inbound(
     e164: &str,
     thread_id: i32,
 ) -> Result<(), AppError> {
-    let row = db.record_inbound(&sms.path, e164, &sms.text, None, &sms.timestamp, thread_id)?;
+    let row = db.record_inbound(
+        &sms.path,
+        e164,
+        &sms.text,
+        None,
+        &sms.timestamp,
+        thread_id,
+        None,
+        None,
+    )?;
     bus.publish(MessageEvent::from(row));
     Ok(())
 }
@@ -1691,6 +1700,8 @@ mod tests {
             None,
             "2026-08-20T22:45:37+03:30",
             42,
+            None,
+            None,
         )
         .unwrap();
         let tg = FakeTg::new();

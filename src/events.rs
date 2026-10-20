@@ -127,6 +127,8 @@ mod tests {
             sms_ts: Some("2026-10-20T09:59:58+00:00".into()),
             status: "ok".into(),
             thread_id: 9,
+            classification: None,
+            otp_code: None,
         };
         let event = MessageEvent::from(row);
         assert_eq!(event.id, "in:7");

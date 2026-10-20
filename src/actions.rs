@@ -1,5 +1,5 @@
 use crate::app::TelegramSink;
-use crate::db::{Contact, Db, Topic};
+use crate::db::{Contact, Db, MessageFilter, Topic};
 use crate::normalize::normalize_e164;
 use crate::route::GENERAL_THREAD;
 
@@ -415,7 +415,13 @@ pub fn list_messages(
     check_message_identity(db, region, thread_id, topic.as_ref(), number, contact_id)?;
 
     let messages = db
-        .messages_for_thread(thread_id, limit, before.as_deref(), after.as_deref())?
+        .messages_for_thread(
+            thread_id,
+            limit,
+            before.as_deref(),
+            after.as_deref(),
+            &MessageFilter::default(),
+        )?
         .into_iter()
         .map(|message| MessageItem {
             id: message.id,
@@ -960,7 +966,7 @@ mod tests {
     #[test]
     fn list_messages_general_without_topic_ok() {
         let db = Db::open_in_memory().unwrap();
-        db.record_inbound("/g", "+98912", "x", None, "", GENERAL_THREAD)
+        db.record_inbound("/g", "+98912", "x", None, "", GENERAL_THREAD, None, None)
             .unwrap();
 
         let out = list_messages(&db, "IR", GENERAL_THREAD, None, None, None, None, None).unwrap();

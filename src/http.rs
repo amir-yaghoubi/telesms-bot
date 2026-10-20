@@ -970,7 +970,7 @@ mod tests {
                 ignored: false,
             })
             .unwrap();
-            db.record_inbound("/g", "+989121234567", "hello", None, "", 9)
+            db.record_inbound("/g", "+989121234567", "hello", None, "", 9, None, None)
                 .unwrap();
             db
         });
