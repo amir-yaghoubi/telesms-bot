@@ -269,6 +269,123 @@ Decisions behind this transport: [ADR 0001](docs/adr/0001-websocket-realtime.md)
 
 ---
 
+## SMS sorting
+
+Messages from numbers without a contact used to all land in General with a loud notification. With
+a classifier, ads, broadcasts, surveys and scams move into per-category **Sorted Threads**, and
+one-time codes are pulled out of the text onto their own line. OTP extraction works with or without
+a classifier. Decision record: [ADR 0002](docs/adr/0002-sms-sorting.md). Vocabulary:
+[CONTEXT.md](CONTEXT.md).
+
+### Enable the classifier
+
+Classification is opt-in. It turns on only when `CLASSIFIER_URL` and `CLASSIFIER_MODEL` are both
+set. The classifier speaks the SystemOne protocol: the gateway posts each inbound SMS with a fixed
+set of questions and reads the answers. Only inbound messages are classified.
+
+| Variable | Role |
+|---|---|
+| `CLASSIFIER_URL` | Classifier endpoint (SystemOne protocol) |
+| `CLASSIFIER_MODEL` | Model name sent with every request |
+| `SORTING_CONFIG_PATH` | Optional JSON file with the sorting config. Unset = built-in defaults |
+
+`SORTING_CONFIG_PATH` replaces the whole config; there is no partial merge. A file that does not
+parse fully stops the daemon at startup. To override, copy
+[`src/sorting/default.json`](src/sorting/default.json), edit the copy, and point the variable at it.
+The file holds the questions, thresholds, retry and breaker policy, sweep policy, and one entry per
+Sort.
+
+### What gets sorted
+
+Only a message that would land in General can be sorted. Contact threads keep today's routing and
+are never moved. For a General-bound message the first matching rule wins:
+
+1. `scam` tag (`is_scam` confidence at least 0.8): the scam Sort.
+2. An OTP Code was found: the `otp` Sort.
+3. Classifier confidence below 0.5: stays in General.
+4. Otherwise the Category's Sort.
+
+A Sort whose thread is off stays in General. Sorted Threads are created on first use. Like General,
+Sorted Threads do not send SMS: text typed there is not sent.
+
+Default table (edit it in the override file):
+
+| Sort | Sorted Thread | Notifications |
+|---|---|---|
+| `scam` | کلاهبرداری/فیشینگ | muted |
+| `otp` | کد یکبارمصرف | loud |
+| `promotional` | تبلیغاتی | muted |
+| `broadcast` | اطلاع‌رسانی عمومی | muted |
+| `feedback` | نظرسنجی | muted |
+| `transactional`, `personal`, `other` | none, stays in General | loud |
+
+A muted thread posts silently.
+
+### Telegram post
+
+Inbound posts use HTML, with the body escaped. When an SMS has a Classification or an OTP Code, the
+post starts with a heading: the Category's emoji and bold title, plus the scam emoji and title when
+tagged. An OTP Code follows on its own line as `<code>…</code>`, which Telegram shows as tap-to-copy.
+Then come the number line (General and Sorted Threads) and the body. A message with neither looks as
+it always did.
+
+If no code was found but the body looks like one (a keyword `کد`, `رمز`, `code`, `otp`, `password`
+or `pin`, plus a standalone 4–8 digit run after digit normalization), the post gets a **Teach code**
+button.
+
+### Teaching OTP codes
+
+Teach the gateway a code's format from one example. Either:
+
+- reply `/otp <code>` to any inbound SMS post, or
+- press **Teach code** and reply to the bot's prompt with the code.
+
+The gateway derives an OTP Pattern from the SMS text, validates it and stores it. That message's OTP
+Code is set, its Telegram post is edited, and `message.updated` is sent over WebSocket. Only that
+message is rescanned; later SMS in the same format are extracted on arrival.
+
+A pattern must have exactly one capture group and at least one letter outside it. For example
+`:\s+(\d{4,8})` is rejected.
+
+### Background classification
+
+When the classifier is on, a sweep runs every 300 s. It classifies inbound messages from the last
+7 days that have no Classification and fewer than 5 failed attempts. After 5 failures a message is
+marked `failed`. Each message gets 3 attempts of up to 10 s, with backoff of 1 s then 3 s. After 3
+consecutive failed messages the breaker opens for 5 minutes, and new messages skip classification
+and stay in General until the sweep reaches them. Sweep results are saved and announced as
+`message.updated`. A sweep never moves a Telegram post.
+
+Classify by hand over the whole history in `DATABASE_PATH`. This needs the classifier variables, and
+announces nothing:
+
+```bash
+telesms-bot classify              # --missing (default): messages with no Classification
+telesms-bot classify --failed     # messages marked failed
+telesms-bot classify --force      # every message, including already classified
+```
+
+It prints `classified N, failed M`, and stops early if the classifier is unreachable.
+
+### API and WebSocket
+
+- Messages gain `classification` (`{category, confidence, tags}`, or `null`) and `otp_code` (string
+  or `null`). WebSocket payloads carry the same two fields. See
+  [Realtime (WebSocket)](#realtime-websocket) for the `message.updated` event.
+- `GET /api/v1/chats/{thread_id}/messages` accepts `category=` (`transactional`, `promotional`,
+  `broadcast`, `feedback`, `personal`, `other`) and `tag=scam`. Unknown values return 400.
+- `GET /api/v1/chats` items gain `kind` (`general`, `contact`, `number` or `sorted`) and `sort` (the
+  Sort key, or `null`).
+
+| Route | Method | What it does |
+|---|---|---|
+| `/api/v1/otp-patterns` | GET | List OTP Patterns |
+| `/api/v1/otp-patterns` | POST | Add a pattern: `{"pattern", "name"?}` |
+| `/api/v1/otp-patterns/{id}` | DELETE | Remove one |
+| `/api/v1/otp-patterns/learn` | POST | Teach from `message_id` or `body`, plus `code` and optional `name` |
+
+---
+
 ## Configuration
 
 Required and common variables (see `.env.example`):
