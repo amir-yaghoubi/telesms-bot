@@ -22,6 +22,9 @@ pub struct Config {
     pub api_key: Option<String>,
     pub api_bind: String,
     pub api_port: u16,
+    pub ws_enabled: bool,
+    pub ws_bind: String,
+    pub ws_port: u16,
 }
 
 #[derive(Debug, Error)]
@@ -96,6 +99,19 @@ impl Config {
                     source: Box::new(e),
                 })?,
             },
+            ws_enabled: match env::var("WS_ENABLED") {
+                Err(_) => false,
+                Ok(v) => parse_ws_enabled(&v)?,
+            },
+            ws_bind: env::var("WS_BIND").unwrap_or_else(|_| "127.0.0.1".to_string()),
+            ws_port: match env::var("WS_PORT") {
+                Err(_) => 8788,
+                Ok(v) if v.trim().is_empty() => 8788,
+                Ok(v) => v.parse::<u16>().map_err(|e| ConfigError::Invalid {
+                    key: "WS_PORT",
+                    source: Box::new(e),
+                })?,
+            },
         })
     }
 
@@ -103,6 +119,13 @@ impl Config {
         self.api_key
             .as_ref()
             .is_some_and(|k| !k.trim().is_empty())
+    }
+
+    /// Whether the WebSocket server may run.
+    ///
+    /// The socket authenticates with the API key, so it needs one.
+    pub fn ws_server_enabled(&self) -> bool {
+        self.ws_enabled && self.api_enabled()
     }
 }
 
@@ -132,6 +155,17 @@ fn parse_sms_delete_enabled(raw: &str) -> Result<bool, ConfigError> {
         "false" | "0" | "no" => Ok(false),
         _ => Err(ConfigError::Invalid {
             key: "SMS_DELETE_ENABLED",
+            source: Box::new(ParseError("expected true/1/yes or false/0/no".into())),
+        }),
+    }
+}
+
+fn parse_ws_enabled(raw: &str) -> Result<bool, ConfigError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "true" | "1" | "yes" => Ok(true),
+        "false" | "0" | "no" => Ok(false),
+        _ => Err(ConfigError::Invalid {
+            key: "WS_ENABLED",
             source: Box::new(ParseError("expected true/1/yes or false/0/no".into())),
         }),
     }
@@ -176,6 +210,9 @@ mod tests {
         std::env::remove_var("API_KEY");
         std::env::remove_var("API_BIND");
         std::env::remove_var("API_PORT");
+        std::env::remove_var("WS_ENABLED");
+        std::env::remove_var("WS_BIND");
+        std::env::remove_var("WS_PORT");
     }
 
     #[test]
@@ -333,6 +370,66 @@ mod tests {
         let c = Config::from_env().unwrap();
         assert!(!c.api_enabled());
         std::env::remove_var("API_KEY");
+    }
+
+    #[test]
+    fn websocket_is_off_by_default() {
+        let _g = ENV_LOCK.lock().unwrap();
+        set_required_env();
+        std::env::set_var("API_KEY", "secret");
+        let c = Config::from_env().unwrap();
+        assert!(!c.ws_enabled);
+        assert!(!c.ws_server_enabled());
+        assert_eq!(c.ws_bind, "127.0.0.1");
+        assert_eq!(c.ws_port, 8788);
+        std::env::remove_var("API_KEY");
+    }
+
+    #[test]
+    fn websocket_needs_both_the_flag_and_an_api_key() {
+        let _g = ENV_LOCK.lock().unwrap();
+        set_required_env();
+        std::env::set_var("WS_ENABLED", "true");
+        let without_key = Config::from_env().unwrap();
+        assert!(without_key.ws_enabled);
+        assert!(!without_key.ws_server_enabled());
+
+        std::env::set_var("API_KEY", "secret");
+        let with_key = Config::from_env().unwrap();
+        assert!(with_key.ws_server_enabled());
+        std::env::remove_var("API_KEY");
+        std::env::remove_var("WS_ENABLED");
+    }
+
+    #[test]
+    fn websocket_reads_bind_and_port() {
+        let _g = ENV_LOCK.lock().unwrap();
+        set_required_env();
+        std::env::set_var("API_KEY", "secret");
+        std::env::set_var("WS_ENABLED", "1");
+        std::env::set_var("WS_BIND", "0.0.0.0");
+        std::env::set_var("WS_PORT", "9999");
+        let c = Config::from_env().unwrap();
+        assert!(c.ws_server_enabled());
+        assert_eq!(c.ws_bind, "0.0.0.0");
+        assert_eq!(c.ws_port, 9999);
+        std::env::remove_var("API_KEY");
+        std::env::remove_var("WS_ENABLED");
+        std::env::remove_var("WS_BIND");
+        std::env::remove_var("WS_PORT");
+    }
+
+    #[test]
+    fn websocket_rejects_garbage() {
+        let _g = ENV_LOCK.lock().unwrap();
+        set_required_env();
+        std::env::set_var("WS_ENABLED", "maybe");
+        assert!(Config::from_env().is_err());
+        std::env::remove_var("WS_ENABLED");
+
+        std::env::set_var("WS_PORT", "not-a-port");
+        assert!(Config::from_env().is_err());
+        std::env::remove_var("WS_PORT");
     }
 
     #[test]

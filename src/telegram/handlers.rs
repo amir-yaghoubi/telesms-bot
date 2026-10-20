@@ -10,11 +10,13 @@ use crate::actions::{
     get_call_forward, ignore, list_numbers, open_topic, put_call_forward, search_contacts,
     send_sms, set_default_number, who, ActionError, Identity,
 };
-use crate::app::{handle_owner_text, AppError, OwnerTextOutcome, TelegramSink};
+use crate::app::{
+    handle_owner_text, AppError, OwnerTextOutcome, SendContext, SendDeps, TelegramSink,
+};
 use crate::call_forward::CallForwardState;
 use crate::config::Config;
 use crate::db::{Contact, Db, PendingForward, PendingForwardMode, Topic};
-use crate::modem::{CallForward, SmsModem};
+use crate::modem::CallForward;
 use crate::route::GENERAL_THREAD;
 
 use super::keyboards::{
@@ -127,10 +129,9 @@ pub(crate) async fn handle_num_callback(
     region: &str,
     thread_id: i32,
     e164: &str,
-    modem: Option<&dyn SmsModem>,
-    tg: &dyn TelegramSink,
-    delete_enabled: bool,
+    ctx: &SendContext<'_>,
 ) -> Result<(), AppError> {
+    let SendContext { tg, .. } = *ctx;
     let Some(topic) = db.get_topic_by_thread(thread_id)? else {
         return Ok(());
     };
@@ -144,20 +145,8 @@ pub(crate) async fn handle_num_callback(
         Err(ActionError::Db(e)) => return Err(e.into()),
         Err(e) => return Err(AppError::Telegram(e.to_string())),
     }
-    if let (Some(modem), Some((pending, pending_reply))) =
-        (modem, db.take_pending_outbound(thread_id)?)
-    {
-        handle_owner_text(
-            db,
-            region,
-            thread_id,
-            &pending,
-            pending_reply,
-            modem,
-            tg,
-            delete_enabled,
-        )
-        .await?;
+    if let Some((pending, pending_reply)) = db.take_pending_outbound(thread_id)? {
+        handle_owner_text(db, region, thread_id, &pending, pending_reply, ctx).await?;
     }
     Ok(())
 }
@@ -292,10 +281,9 @@ pub async fn handle_sms(
     text: &str,
     reply_thread: i32,
     reply_to: Option<i32>,
-    modem: &dyn SmsModem,
-    tg: &dyn TelegramSink,
-    delete_enabled: bool,
+    ctx: &SendContext<'_>,
 ) -> Result<(), AppError> {
+    let SendContext { tg, .. } = *ctx;
     match send_sms(
         db,
         region,
@@ -306,9 +294,7 @@ pub async fn handle_sms(
         text,
         reply_thread,
         reply_to,
-        modem,
-        tg,
-        delete_enabled,
+        ctx,
     )
     .await
     {
@@ -633,7 +619,7 @@ async fn on_message(
     msg: Message,
     cfg: Config,
     db: Arc<Db>,
-    modem: Arc<dyn SmsModem>,
+    send: SendDeps,
     info: Arc<dyn crate::modem::ModemInfo>,
     forward: Arc<dyn CallForward>,
 ) -> Result<(), AppError> {
@@ -676,6 +662,12 @@ async fn on_message(
         return Ok(());
     }
     if let Some((raw, body)) = parse_sms_cmd(text) {
+        let ctx = SendContext {
+            modem: send.modem.as_ref(),
+            tg: &tg,
+            bus: &send.bus,
+            delete_enabled: cfg.sms_delete_enabled,
+        };
         handle_sms(
             &db,
             &cfg.default_region,
@@ -683,9 +675,7 @@ async fn on_message(
             &body,
             thread_id,
             Some(reply_to),
-            modem.as_ref(),
-            &tg,
-            cfg.sms_delete_enabled,
+            &ctx,
         )
         .await?;
         return Ok(());
@@ -748,15 +738,19 @@ async fn on_message(
         }
         Some(_) => {}
         None if thread_id != GENERAL_THREAD => {
+            let ctx = SendContext {
+                modem: send.modem.as_ref(),
+                tg: &tg,
+                bus: &send.bus,
+                delete_enabled: cfg.sms_delete_enabled,
+            };
             match handle_owner_text(
                 &db,
                 &cfg.default_region,
                 thread_id,
                 text,
                 Some(reply_to),
-                modem.as_ref(),
-                &tg,
-                cfg.sms_delete_enabled,
+                &ctx,
             )
             .await?
             {
@@ -776,7 +770,7 @@ async fn on_callback(
     q: CallbackQuery,
     cfg: Config,
     db: Arc<Db>,
-    modem: Arc<dyn SmsModem>,
+    send: SendDeps,
     info: Arc<dyn crate::modem::ModemInfo>,
     forward: Arc<dyn CallForward>,
 ) -> Result<(), AppError> {
@@ -939,16 +933,13 @@ async fn on_callback(
             }
         }
     } else if let Some(e164) = parse_num_callback(data) {
-        handle_num_callback(
-            &db,
-            &cfg.default_region,
-            thread_id,
-            e164,
-            Some(modem.as_ref()),
-            &tg,
-            cfg.sms_delete_enabled,
-        )
-        .await
+        let ctx = SendContext {
+            modem: send.modem.as_ref(),
+            tg: &tg,
+            bus: &send.bus,
+            delete_enabled: cfg.sms_delete_enabled,
+        };
+        handle_num_callback(&db, &cfg.default_region, thread_id, e164, &ctx).await
     } else if let Some(contact_id) = parse_open_callback(data) {
         handle_open(&db, cfg.telegram_group_id, thread_id, contact_id, &tg).await
     } else {
@@ -981,14 +972,14 @@ async fn on_inline_query(bot: Bot, q: InlineQuery, db: Arc<Db>) -> Result<(), Ap
 pub async fn dispatch(
     cfg: Config,
     db: Arc<Db>,
-    modem: Arc<dyn SmsModem>,
+    send: SendDeps,
     info: Arc<dyn crate::modem::ModemInfo>,
     forward: Arc<dyn CallForward>,
 ) {
     let bot = Bot::new(cfg.telegram_bot_token.clone());
     register_commands(&bot, cfg.telegram_group_id).await;
     Dispatcher::builder(bot, schema())
-        .dependencies(dptree::deps![cfg, db, modem, info, forward])
+        .dependencies(dptree::deps![cfg, db, send, info, forward])
         .error_handler(LoggingErrorHandler::with_custom_text(
             "telegram handler error",
         ))

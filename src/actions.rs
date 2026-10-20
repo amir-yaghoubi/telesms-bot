@@ -57,6 +57,70 @@ pub enum ActionError {
     App(#[from] crate::app::AppError),
 }
 
+impl ActionError {
+    /// Stable machine-readable code, shared by every transport.
+    pub fn code(&self) -> &'static str {
+        match self {
+            ActionError::MissingIdentity => "missing_identity",
+            ActionError::Validation(_) => "validation",
+            ActionError::InvalidNumber(_) => "invalid_number",
+            ActionError::NotFound(_) => "not_found",
+            ActionError::IdentityConflict => "identity_conflict",
+            ActionError::NeedDefaultNumber { .. } => "need_default_number",
+            ActionError::ContactsUnavailable => "contacts_unavailable",
+            ActionError::ModemFailed(_) => "modem_failed",
+            ActionError::ModemUnavailable(_) => "modem_unavailable",
+            ActionError::ForwardFailed(_) => "forward_failed",
+            ActionError::TelegramFailed { .. } => "telegram_failed",
+            ActionError::Db(_) | ActionError::App(_) => "internal",
+        }
+    }
+
+    /// Failure description shared by every transport.
+    pub fn error_body(&self) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "error": self.code(),
+            "message": self.to_string(),
+        });
+        match self {
+            ActionError::NeedDefaultNumber { numbers } => {
+                body["numbers"] = serde_json::json!(numbers);
+            }
+            ActionError::TelegramFailed { sent, .. } => {
+                body["sent"] = serde_json::json!(sent);
+            }
+            _ => {}
+        }
+        body
+    }
+}
+
+/// Build an identity from the fields a client may provide.
+///
+/// A thread on its own is not an identity: it carries no number to send to.
+pub fn identity_from_parts(
+    number: Option<String>,
+    contact_id: Option<i64>,
+    thread_id: Option<i32>,
+) -> Result<Identity, ActionError> {
+    let number = number
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let has_number = number.is_some();
+    let has_contact = contact_id.is_some();
+    let has_thread = thread_id.is_some();
+
+    if has_thread && !has_number && !has_contact {
+        return Err(ActionError::MissingIdentity);
+    }
+
+    Ok(Identity {
+        number,
+        contact_id,
+        thread_id,
+    })
+}
+
 pub fn resolve(
     db: &Db,
     region: &str,
@@ -669,10 +733,9 @@ pub async fn send_sms(
     text: &str,
     reply_thread: i32,
     reply_to: Option<i32>,
-    modem: &dyn crate::modem::SmsModem,
-    tg: &dyn TelegramSink,
-    delete_enabled: bool,
+    ctx: &crate::app::SendContext<'_>,
 ) -> Result<SmsSent, ActionError> {
+    let crate::app::SendContext { tg, .. } = *ctx;
     let text = text.trim();
     if text.is_empty() {
         return Err(ActionError::Validation("text required".into()));
@@ -690,17 +753,7 @@ pub async fn send_sms(
             .e164
             .ok_or_else(|| ActionError::InvalidNumber("missing number".into()))?;
         let thread_id = resolve_send_thread(db, &e164, reply_thread, tg).await?;
-        crate::app::send_and_ack(
-            db,
-            &e164,
-            text,
-            thread_id,
-            reply_to,
-            modem,
-            tg,
-            delete_enabled,
-        )
-        .await?;
+        crate::app::send_and_ack(db, &e164, text, thread_id, reply_to, ctx).await?;
         return Ok(SmsSent {
             e164,
             thread_id,
@@ -724,17 +777,7 @@ pub async fn send_sms(
         }
     };
     let thread_id = topic.thread_id;
-    crate::app::send_and_ack(
-        db,
-        &e164,
-        text,
-        thread_id,
-        reply_to,
-        modem,
-        tg,
-        delete_enabled,
-    )
-    .await?;
+    crate::app::send_and_ack(db, &e164, text, thread_id, reply_to, ctx).await?;
     Ok(SmsSent {
         e164,
         thread_id,
@@ -794,6 +837,25 @@ pub async fn status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bus to announce through; tests that do not care ignore it.
+    fn bus() -> crate::events::EventBus {
+        crate::events::EventBus::new(16)
+    }
+
+    /// A send context for tests.
+    fn send_context<'a>(
+        modem: &'a dyn crate::modem::SmsModem,
+        tg: &'a dyn crate::app::TelegramSink,
+        bus: &'a crate::events::EventBus,
+    ) -> crate::app::SendContext<'a> {
+        crate::app::SendContext {
+            modem,
+            tg,
+            bus,
+            delete_enabled: true,
+        }
+    }
     use crate::db::{Db, Topic};
     use crate::route::GENERAL_THREAD;
 
@@ -1370,9 +1432,7 @@ mod tests {
             "hello",
             1,
             Some(7),
-            &modem,
-            &tg,
-            true,
+            &send_context(&modem, &tg, &bus()),
         )
         .await
         .unwrap();
@@ -1417,9 +1477,7 @@ mod tests {
             "hi",
             9,
             None,
-            &modem,
-            &tg,
-            true,
+            &send_context(&modem, &tg, &bus()),
         )
         .await
         .unwrap_err();
@@ -1448,9 +1506,7 @@ mod tests {
             "x",
             1,
             None,
-            &modem,
-            &tg,
-            true,
+            &send_context(&modem, &tg, &bus()),
         )
         .await
         .unwrap_err();

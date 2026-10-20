@@ -59,6 +59,8 @@ pub enum DbError {
     Poisoned,
     #[error("contacts unavailable")]
     ContactsUnavailable,
+    #[error("inbound row missing: {0}")]
+    MissingInboundRow(String),
 }
 
 pub struct Db {
@@ -105,6 +107,7 @@ pub struct MessageRow {
     pub timestamp: String,
     pub sms_ts: Option<String>,
     pub status: String,
+    pub thread_id: i32,
 }
 
 pub struct TodaySmsCounts {
@@ -605,11 +608,12 @@ impl Db {
         Ok(())
     }
 
-    /// Record an inbound message. mm_path is a recycled ModemManager slot
-    /// id (renumbered from 0 at every restart), so a stale row may already
-    /// hold the path for an unrelated older message; on conflict the row is
-    /// refreshed to the new message. Dedup itself is content-based via
-    /// `seen_sms`.
+    /// Record an inbound message and return the row it wrote.
+    ///
+    /// mm_path is a recycled ModemManager slot id (renumbered from 0 at every
+    /// restart), so a stale row may already hold the path for an unrelated
+    /// older message; on conflict the row is refreshed to the new message.
+    /// Dedup itself is content-based via `seen_sms`.
     pub fn record_inbound(
         &self,
         path: &str,
@@ -618,37 +622,75 @@ impl Db {
         tg_msg: Option<i32>,
         sms_ts: &str,
         thread_id: i32,
-    ) -> Result<(), DbError> {
-        let conn = self.conn()?;
-        conn.execute(
-            "INSERT INTO inbound_log (mm_path, e164, body, tg_msg, created_at, sms_ts, thread_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(mm_path) DO UPDATE SET
-               e164 = excluded.e164,
-               body = excluded.body,
-               tg_msg = excluded.tg_msg,
-               created_at = excluded.created_at,
-               sms_ts = excluded.sms_ts,
-               thread_id = excluded.thread_id",
-            rusqlite::params![path, e164, text, tg_msg, Self::now(), sms_ts, thread_id],
-        )?;
-        Ok(())
+    ) -> Result<MessageRow, DbError> {
+        let created_at = Self::now();
+        {
+            let conn = self.conn()?;
+            conn.execute(
+                "INSERT INTO inbound_log (mm_path, e164, body, tg_msg, created_at, sms_ts, thread_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(mm_path) DO UPDATE SET
+                   e164 = excluded.e164,
+                   body = excluded.body,
+                   tg_msg = excluded.tg_msg,
+                   created_at = excluded.created_at,
+                   sms_ts = excluded.sms_ts,
+                   thread_id = excluded.thread_id",
+                rusqlite::params![path, e164, text, tg_msg, created_at, sms_ts, thread_id],
+            )?;
+        }
+        let row_id = self.inbound_row_id(path)?;
+        Ok(MessageRow {
+            id: format!("in:{row_id}"),
+            direction: "in".into(),
+            e164: e164.to_string(),
+            body: text.to_string(),
+            timestamp: created_at,
+            sms_ts: Some(sms_ts.to_string()).filter(|value| !value.is_empty()),
+            status: "ok".into(),
+            thread_id,
+        })
     }
 
+    /// Record an outbound message and return the row it wrote.
     pub fn record_outbound(
         &self,
         e164: &str,
         text: &str,
         result: &str,
         thread_id: i32,
-    ) -> Result<(), DbError> {
+    ) -> Result<MessageRow, DbError> {
+        let created_at = Self::now();
+        let row_id = {
+            let conn = self.conn()?;
+            conn.execute(
+                "INSERT INTO outbound_log (e164, body, result, created_at, thread_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![e164, text, result, created_at, thread_id],
+            )?;
+            conn.last_insert_rowid()
+        };
+        Ok(MessageRow {
+            id: format!("out:{row_id}"),
+            direction: "out".into(),
+            e164: e164.to_string(),
+            body: text.to_string(),
+            timestamp: created_at,
+            sms_ts: None,
+            status: if result == "ok" { "ok" } else { "failed" }.into(),
+            thread_id,
+        })
+    }
+
+    fn inbound_row_id(&self, path: &str) -> Result<i64, DbError> {
         let conn = self.conn()?;
-        conn.execute(
-            "INSERT INTO outbound_log (e164, body, result, created_at, thread_id)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![e164, text, result, Self::now(), thread_id],
-        )?;
-        Ok(())
+        conn.query_row(
+            "SELECT id FROM inbound_log WHERE mm_path = ?1",
+            [path],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(DbError::MissingInboundRow(path.to_string()))
     }
 
     pub fn backfill_thread_ids(&self) -> Result<u64, DbError> {
@@ -774,7 +816,7 @@ impl Db {
     ) -> Result<Vec<MessageRow>, DbError> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, direction, e164, body, ts, sms_ts, status
+            "SELECT id, direction, e164, body, ts, sms_ts, status, tid
              FROM (
                SELECT id, 'in' AS direction, e164, body, created_at AS ts, sms_ts,
                       'ok' AS status, COALESCE(thread_id, 1) AS tid
@@ -804,6 +846,49 @@ impl Db {
                     timestamp: row.get(4)?,
                     sms_ts: sms_ts.filter(|value| !value.is_empty()),
                     status: row.get(6)?,
+                    thread_id: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(messages)
+    }
+
+    /// Messages recorded after `after`, oldest first, across every thread.
+    ///
+    /// Used by realtime subscribers that reconnect with a cursor and need the
+    /// messages they missed while they were away.
+    pub fn messages_after(&self, after: &str, limit: i64) -> Result<Vec<MessageRow>, DbError> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, direction, e164, body, ts, sms_ts, status, tid
+             FROM (
+               SELECT id, 'in' AS direction, e164, body, created_at AS ts, sms_ts,
+                      'ok' AS status, COALESCE(thread_id, 1) AS tid
+               FROM inbound_log
+               UNION ALL
+               SELECT id, 'out', e164, body, created_at, NULL,
+                      CASE WHEN result = 'ok' THEN 'ok' ELSE 'failed' END,
+                      COALESCE(thread_id, 1)
+               FROM outbound_log
+             )
+             WHERE ts > ?1
+             ORDER BY ts ASC, id ASC
+             LIMIT ?2",
+        )?;
+        let messages = stmt
+            .query_map(rusqlite::params![after, limit], |row| {
+                let id: i64 = row.get(0)?;
+                let direction: String = row.get(1)?;
+                let sms_ts: Option<String> = row.get(5)?;
+                Ok(MessageRow {
+                    id: format!("{direction}:{id}"),
+                    direction,
+                    e164: row.get(2)?,
+                    body: row.get(3)?,
+                    timestamp: row.get(4)?,
+                    sms_ts: sms_ts.filter(|value| !value.is_empty()),
+                    status: row.get(6)?,
+                    thread_id: row.get(7)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -904,6 +989,65 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recording_an_inbound_message_returns_the_recorded_row() {
+        let db = Db::open_in_memory().unwrap();
+        let row = db
+            .record_inbound(
+                "/sms/1",
+                "+989121234567",
+                "hello",
+                None,
+                "2026-10-20T10:00:00+00:00",
+                9,
+            )
+            .unwrap();
+
+        assert_eq!(row.direction, "in");
+        assert_eq!(row.e164, "+989121234567");
+        assert_eq!(row.body, "hello");
+        assert_eq!(row.status, "ok");
+        assert_eq!(row.thread_id, 9);
+        assert_eq!(row.sms_ts.as_deref(), Some("2026-10-20T10:00:00+00:00"));
+        assert!(row.id.starts_with("in:"), "id: {}", row.id);
+        assert!(!row.timestamp.is_empty());
+    }
+
+    #[test]
+    fn recording_an_outbound_message_returns_its_status() {
+        let db = Db::open_in_memory().unwrap();
+        let sent = db.record_outbound("+989121234567", "hi", "ok", 9).unwrap();
+        let failed = db
+            .record_outbound("+989121234567", "hi", "modem error", 9)
+            .unwrap();
+
+        assert_eq!(sent.direction, "out");
+        assert_eq!(sent.status, "ok");
+        assert_eq!(failed.status, "failed");
+        assert!(sent.id.starts_with("out:"), "id: {}", sent.id);
+    }
+
+    #[test]
+    fn a_recorded_message_matches_what_the_api_returns() {
+        let db = Db::open_in_memory().unwrap();
+        let row = db
+            .record_inbound(
+                "/sms/1",
+                "+989121234567",
+                "hello",
+                None,
+                "2026-10-20T10:00:00+00:00",
+                9,
+            )
+            .unwrap();
+
+        let rows = db.messages_for_thread(9, 10, None, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, row.id);
+        assert_eq!(rows[0].body, "hello");
+        assert_eq!(rows[0].thread_id, 9);
+    }
 
     #[test]
     fn find_contact_by_e164_first_match_and_flag_ambiguity() {
