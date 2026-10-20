@@ -1087,9 +1087,9 @@ pub async fn dispatch(
     send: SendDeps,
     info: Arc<dyn crate::modem::ModemInfo>,
     forward: Arc<dyn CallForward>,
+    sorting: Arc<SortingConfig>,
 ) {
     let bot = Bot::new(cfg.telegram_bot_token.clone());
-    let sorting = crate::sorting::Sorting::disabled().config;
     register_commands(&bot, cfg.telegram_group_id).await;
     Dispatcher::builder(bot, schema())
         .dependencies(dptree::deps![cfg, db, send, sorting, info, forward])
