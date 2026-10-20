@@ -283,6 +283,10 @@ Classification is opt-in. It turns on only when `CLASSIFIER_URL` and `CLASSIFIER
 set. The classifier speaks the SystemOne protocol: the gateway posts each inbound SMS with a fixed
 set of questions and reads the answers. Only inbound messages are classified.
 
+The full SMS body is sent to `CLASSIFIER_URL`, one-time codes and other secrets included. Pointing
+it at a non-local server is a deliberate choice: run the classifier on the same machine or a
+network you trust.
+
 | Variable | Role |
 |---|---|
 | `CLASSIFIER_URL` | Classifier endpoint (SystemOne protocol) |
@@ -290,7 +294,8 @@ set of questions and reads the answers. Only inbound messages are classified.
 | `SORTING_CONFIG_PATH` | Optional JSON file with the sorting config. Unset = built-in defaults |
 
 `SORTING_CONFIG_PATH` replaces the whole config; there is no partial merge. A file that does not
-parse fully stops the daemon at startup. To override, copy
+parse fully stops the daemon at startup: an invalid `SORTING_CONFIG_PATH` makes the daemon exit
+instead of falling back to the defaults. To override, copy
 [`src/sorting/default.json`](src/sorting/default.json), edit the copy, and point the variable at it.
 The file holds the questions, thresholds, retry and breaker policy, sweep policy, and one entry per
 Sort.
