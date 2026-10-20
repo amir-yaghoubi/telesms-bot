@@ -103,6 +103,7 @@ async fn run_daemon() {
         tg: tg.clone(),
         delete_enabled: cfg.sms_delete_enabled,
         bus: bus.clone(),
+        sorting: telesms_bot::sorting::Sorting::disabled(),
     };
     let mm_in = mm.clone();
     let cancel_in = cancel.clone();

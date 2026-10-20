@@ -586,6 +586,7 @@ mod tests {
                 default_e164: Some("+989121234567".into()),
                 title: "Ali".into(),
                 ignored: false,
+                sort: None,
             })
             .unwrap();
             db

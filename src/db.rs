@@ -107,6 +107,7 @@ pub struct Topic {
     pub default_e164: Option<String>,
     pub title: String,
     pub ignored: bool,
+    pub sort: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -557,7 +558,7 @@ impl Db {
 
     pub fn get_topic_by_thread(&self, thread_id: i32) -> Result<Option<Topic>, DbError> {
         self.get_topic(
-            "SELECT thread_id, contact_id, default_e164, title, ignored
+            "SELECT thread_id, contact_id, default_e164, title, ignored, sort
              FROM topics WHERE thread_id = ?1",
             rusqlite::params![thread_id],
         )
@@ -565,7 +566,7 @@ impl Db {
 
     pub fn get_topic_by_contact(&self, contact_id: i64) -> Result<Option<Topic>, DbError> {
         self.get_topic(
-            "SELECT thread_id, contact_id, default_e164, title, ignored
+            "SELECT thread_id, contact_id, default_e164, title, ignored, sort
              FROM topics WHERE contact_id = ?1
              ORDER BY thread_id ASC
              LIMIT 1",
@@ -575,7 +576,7 @@ impl Db {
 
     pub fn get_topic_by_e164(&self, e164: &str) -> Result<Option<Topic>, DbError> {
         self.get_topic(
-            "SELECT thread_id, contact_id, default_e164, title, ignored
+            "SELECT thread_id, contact_id, default_e164, title, ignored, sort
              FROM topics WHERE default_e164 = ?1
              ORDER BY thread_id ASC
              LIMIT 1",
@@ -602,6 +603,7 @@ impl Db {
             default_e164: row.get(2)?,
             title: row.get(3)?,
             ignored: row.get::<_, i64>(4)? != 0,
+            sort: row.get(5)?,
         })
     }
 
@@ -1418,6 +1420,7 @@ mod tests {
             default_e164: None,
             title: "Ali (1111)".into(),
             ignored: false,
+            sort: None,
         })
         .unwrap();
         db.set_default_number(42, "+989111111111").unwrap();
@@ -1691,6 +1694,7 @@ mod tests {
             default_e164: Some("+989121111111".into()),
             title: "Ali".into(),
             ignored: false,
+            sort: None,
         })
         .unwrap();
 
@@ -1742,6 +1746,7 @@ mod tests {
             default_e164: Some("+989121111111".into()),
             title: "Ali (1111)".into(),
             ignored: false,
+            sort: None,
         })
         .unwrap();
         db.record_inbound("/1", "+989129999999", "unknown", None, "", 1, None, None)
@@ -1777,6 +1782,7 @@ mod tests {
             default_e164: Some("+98912".into()),
             title: "X".into(),
             ignored: false,
+            sort: None,
         })
         .unwrap();
         db.record_inbound(

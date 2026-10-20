@@ -175,6 +175,7 @@ fn format_who_marks_default() {
         default_e164: Some("+98912".into()),
         title: "Ali".into(),
         ignored: false,
+        sort: None,
     };
     let s = format_who(&t, Some("Ali"), &["+98912".into(), "+98913".into()]);
     assert!(s.contains("Ali"));
@@ -239,6 +240,7 @@ async fn who_in_contact_topic_lists_numbers() {
         default_e164: Some("+98912".into()),
         title: "Ali".into(),
         ignored: false,
+        sort: None,
     })
     .unwrap();
     let tg = FakeTg::new();
@@ -272,6 +274,7 @@ async fn num_callback_sets_default_and_posts() {
         default_e164: Some("+98912".into()),
         title: "Ali".into(),
         ignored: false,
+        sort: None,
     })
     .unwrap();
     let tg = FakeTg::new();
@@ -305,6 +308,7 @@ async fn num_callback_sends_pending_text() {
         default_e164: None,
         title: "Ali".into(),
         ignored: false,
+        sort: None,
     })
     .unwrap();
     db.set_pending_outbound(9, "hello", Some(11)).unwrap();
@@ -353,6 +357,7 @@ async fn ignore_contact_topic_ignores_all_numbers() {
         default_e164: Some("+98912".into()),
         title: "Ali".into(),
         ignored: false,
+        sort: None,
     })
     .unwrap();
     let tg = FakeTg::new();
@@ -383,6 +388,7 @@ async fn ignore_contact_topic_empty_numbers_posts_hint() {
         default_e164: None,
         title: "Ali".into(),
         ignored: false,
+        sort: None,
     })
     .unwrap();
     let tg = FakeTg::new();
@@ -405,6 +411,7 @@ async fn num_callback_avoids_identity_conflict() {
         default_e164: Some("+98912".into()),
         title: "Ali".into(),
         ignored: false,
+        sort: None,
     })
     .unwrap();
     db.upsert_topic(&Topic {
@@ -413,6 +420,7 @@ async fn num_callback_avoids_identity_conflict() {
         default_e164: Some("+98913".into()),
         title: "+98913".into(),
         ignored: false,
+        sort: None,
     })
     .unwrap();
     let tg = FakeTg::new();
@@ -435,6 +443,18 @@ async fn num_callback_avoids_identity_conflict() {
 }
 
 #[tokio::test]
+async fn ignore_reply_in_sorted_thread_ignores_the_number() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_sorted_topic("promotional", 77, "تبلیغاتی")
+        .unwrap();
+    let tg = FakeTg::new();
+    handle_ignore(&db, "IR", 77, Some("🟨 تبلیغاتی\n+989121234567\nhi"), &tg)
+        .await
+        .unwrap();
+    assert!(db.is_ignored("+989121234567").unwrap());
+}
+
+#[tokio::test]
 async fn ignore_general_reply_parses_plus() {
     let db = Db::open_in_memory().unwrap();
     let tg = FakeTg::new();
@@ -447,7 +467,20 @@ async fn ignore_general_reply_parses_plus() {
 #[test]
 fn parse_ignore_reply_requires_plus() {
     assert_eq!(parse_ignore_reply("+98912\nhello"), Some("+98912"));
-    assert!(parse_ignore_reply("hello\n+98912").is_none());
+    assert!(parse_ignore_reply("hello\n98912").is_none());
+}
+
+#[test]
+fn ignore_reply_skips_heading_lines() {
+    assert_eq!(
+        parse_ignore_reply("🟨 <b>تبلیغاتی</b>\n<code>1234</code>\n+989981600237\nbody"),
+        Some("+989981600237")
+    );
+    assert_eq!(
+        parse_ignore_reply("🟨 تبلیغاتی\n1234\n+989981600237\nbody"),
+        Some("+989981600237")
+    );
+    assert!(parse_ignore_reply("🟨 تبلیغاتی\n1234\nbody").is_none());
 }
 
 #[tokio::test]
@@ -496,6 +529,7 @@ async fn sms_does_not_apply_incoming_default() {
         default_e164: Some(a.into()),
         title: "Ali (0001)".into(),
         ignored: false,
+        sort: None,
     })
     .unwrap();
     let tg = FakeTg::new();
@@ -614,6 +648,7 @@ fn topic_open_message_link_or_fallback() {
         default_e164: None,
         title: "Ali".into(),
         ignored: false,
+        sort: None,
     };
     assert_eq!(
         topic_open_message(-1001234567890, &t),
@@ -707,6 +742,7 @@ async fn open_existing_posts_link_without_create() {
         default_e164: Some("+98912".into()),
         title: "Ali".into(),
         ignored: false,
+        sort: None,
     })
     .unwrap();
     let tg = FakeTg::new();

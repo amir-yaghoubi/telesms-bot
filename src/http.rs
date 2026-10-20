@@ -599,6 +599,7 @@ mod tests {
                 default_e164: Some("+989121234567".into()),
                 title: "Ali".into(),
                 ignored: false,
+                sort: None,
             })
             .unwrap();
             db
@@ -971,6 +972,7 @@ mod tests {
                 default_e164: Some("+989121234567".into()),
                 title: "Ali".into(),
                 ignored: false,
+                sort: None,
             })
             .unwrap();
             db.record_inbound("/g", "+989121234567", "hello", None, "", 9, None, None)

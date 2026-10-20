@@ -79,6 +79,7 @@ pub(crate) async fn handle_who(
                 default_e164: w.default_e164.clone(),
                 title: w.display_name.clone(),
                 ignored: false,
+                sort: None,
             };
             let mut text = format_who(&topic, Some(&w.display_name), &w.numbers);
             if w.ambiguous {
@@ -241,12 +242,15 @@ pub(crate) async fn handle_ignore(
     reply_text: Option<&str>,
     tg: &dyn TelegramSink,
 ) -> Result<(), AppError> {
-    let identity = if thread_id == GENERAL_THREAD {
+    let topic = db.get_topic_by_thread(thread_id)?;
+    let like_general =
+        thread_id == GENERAL_THREAD || topic.as_ref().is_some_and(|t| t.sort.is_some());
+    let identity = if like_general {
         Identity {
             number: reply_text.and_then(parse_ignore_reply).map(str::to_string),
             ..Default::default()
         }
-    } else if let Some(topic) = db.get_topic_by_thread(thread_id)? {
+    } else if let Some(topic) = topic {
         Identity {
             contact_id: topic.contact_id,
             thread_id: Some(thread_id),

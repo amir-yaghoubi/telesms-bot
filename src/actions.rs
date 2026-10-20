@@ -652,6 +652,7 @@ pub async fn open_topic(
             default_e164,
             title: title.clone(),
             ignored: false,
+            sort: None,
         })?;
         return Ok(Opened {
             contact_id: Some(contact.id),
@@ -670,6 +671,7 @@ pub async fn open_topic(
             default_e164: Some(e164),
             title: title.clone(),
             ignored: false,
+            sort: None,
         })?;
         return Ok(Opened {
             contact_id: None,
@@ -710,6 +712,7 @@ async fn resolve_send_thread(
                 default_e164: Some(default_e164),
                 title,
                 ignored: false,
+                sort: None,
             })?;
             thread_id
         }
@@ -725,6 +728,7 @@ async fn resolve_send_thread(
                     default_e164: Some(dest.clone()),
                     title: dest,
                     ignored: false,
+                    sort: None,
                 })?;
                 thread_id
             }
@@ -876,6 +880,7 @@ mod tests {
             default_e164: Some("+989121234567".into()),
             title: "Ali".into(),
             ignored: false,
+            sort: None,
         })
         .unwrap();
         (db, id)
@@ -918,6 +923,7 @@ mod tests {
                 default_e164: Some(e164.into()),
                 title: title.into(),
                 ignored: false,
+                sort: None,
             })
             .unwrap();
         }
@@ -1012,6 +1018,7 @@ mod tests {
             default_e164: Some("+989121111111".into()),
             title: "Ali".into(),
             ignored: false,
+            sort: None,
         })
         .unwrap();
         let err = list_messages(&db, "IR", 42, None, None, None, None, Some(id + 1)).unwrap_err();
@@ -1065,6 +1072,7 @@ mod tests {
             default_e164: Some("+989121111111".into()),
             title: "Unknown".into(),
             ignored: false,
+            sort: None,
         })
         .unwrap();
 
@@ -1083,6 +1091,7 @@ mod tests {
             default_e164: Some("+98912".into()),
             title: "Unknown".into(),
             ignored: false,
+            sort: None,
         })
         .unwrap();
         db.insert_inbound_at("/m", "+98912", "hello", "2026-08-20T08:00:00Z", Some(42))
@@ -1338,6 +1347,7 @@ mod tests {
             default_e164: Some("+98912".into()),
             title: "Ali".into(),
             ignored: false,
+            sort: None,
         })
         .unwrap();
         let tg = crate::app::FakeTg::new();
@@ -1469,6 +1479,7 @@ mod tests {
             default_e164: None,
             title: "Ali".into(),
             ignored: false,
+            sort: None,
         })
         .unwrap();
         let tg = crate::app::FakeTg::new();
