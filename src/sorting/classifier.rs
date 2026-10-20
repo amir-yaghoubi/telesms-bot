@@ -81,6 +81,15 @@ pub fn build_state(e164: &str, body: &str) -> serde_json::Value {
     })
 }
 
+const CATEGORIES: [&str; 6] = [
+    "transactional",
+    "promotional",
+    "broadcast",
+    "feedback",
+    "personal",
+    "other",
+];
+
 fn parse_answers(
     answers: &serde_json::Value,
     scam_threshold: f64,
@@ -90,6 +99,9 @@ fn parse_answers(
     let category = cat["choice"]
         .as_str()
         .ok_or_else(|| malformed("category.choice"))?;
+    if !CATEGORIES.contains(&category) {
+        return Err(malformed(&format!("unknown category '{category}'")));
+    }
     let confidence = cat["confidence"]
         .as_f64()
         .ok_or_else(|| malformed("category.confidence"))?;
@@ -288,6 +300,20 @@ mod tests {
         let (url, _) = serve(json!({"answers": {"category": {}}})).await;
         let err = client(url).classify("Bank", "hi").await.unwrap_err();
         assert!(matches!(err, ClassifyError::Malformed(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn unknown_category_is_malformed() {
+        let (url, _) = serve(json!({"answers": {
+            "category": {"choice": "spam", "confidence": 0.9, "probabilities": {"spam": 0.9}},
+            "is_scam": {"noul": 0.1}
+        }}))
+        .await;
+        let err = client(url).classify("Bank", "hi").await.unwrap_err();
+        assert!(
+            matches!(&err, ClassifyError::Malformed(m) if m.contains("spam")),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
