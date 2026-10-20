@@ -9,6 +9,7 @@ pub mod http;
 pub mod modem;
 pub mod modem_mm;
 pub mod normalize;
+pub mod otp;
 pub mod route;
 pub mod status;
 pub mod telegram;
