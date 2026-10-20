@@ -191,12 +191,12 @@ pub fn topic_open_message(group_id: i64, topic: &Topic) -> String {
     }
 }
 
-/// The number a reply targets: the first line that starts with `+`, so the
-/// heading and code lines of a sorted post are skipped.
+/// The number a reply targets: the first line that starts with `+` and digits,
+/// so the heading, code and any `+`-prefixed text are skipped.
 pub fn parse_ignore_reply(text: &str) -> Option<&str> {
-    text.lines()
-        .map(str::trim)
-        .find(|line| line.starts_with('+'))?
-        .split_whitespace()
-        .next()
+    text.lines().find_map(|line| {
+        let token = line.split_whitespace().next()?;
+        let digits = token.strip_prefix('+')?;
+        (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then_some(token)
+    })
 }

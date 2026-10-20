@@ -483,6 +483,16 @@ fn ignore_reply_skips_heading_lines() {
     assert!(parse_ignore_reply("🟨 تبلیغاتی\n1234\nbody").is_none());
 }
 
+#[test]
+fn ignore_reply_skips_non_numeric_plus_lines() {
+    assert_eq!(
+        parse_ignore_reply("🟨 تبلیغاتی\n+50% off\n+989981600237\nbody"),
+        Some("+989981600237")
+    );
+    assert!(parse_ignore_reply("🟨 تبلیغاتی\nSnapp\n+50% off").is_none());
+    assert!(parse_ignore_reply("+\nbody").is_none());
+}
+
 #[tokio::test]
 async fn sms_ignored_number_stays_in_general() {
     let db = Db::open_in_memory().unwrap();
