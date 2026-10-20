@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -411,6 +412,8 @@ pub struct FakeTg {
     pub next_thread: AtomicI32,
     pub next_message: AtomicI32,
     pub fail: AtomicBool,
+    /// Threads deleted in Telegram: posting into them fails.
+    pub missing_threads: Mutex<HashSet<i32>>,
 }
 
 impl FakeTg {
@@ -425,6 +428,7 @@ impl FakeTg {
             next_thread: AtomicI32::new(100),
             next_message: AtomicI32::new(500),
             fail: AtomicBool::new(false),
+            missing_threads: Mutex::new(HashSet::new()),
         }
     }
 }
@@ -480,6 +484,16 @@ impl TelegramSink for FakeTg {
     async fn post_rich(&self, thread_id: i32, post: RichPost) -> Result<i32, AppError> {
         if self.fail.load(Ordering::SeqCst) {
             return Err(AppError::Telegram("fail".into()));
+        }
+        if self
+            .missing_threads
+            .lock()
+            .expect("fake tg missing threads lock")
+            .contains(&thread_id)
+        {
+            return Err(AppError::Telegram(
+                "Bad Request: message thread not found".into(),
+            ));
         }
         self.rich_posts
             .lock()
@@ -896,24 +910,50 @@ async fn post_to_general(
         understood.otp_code,
         &sorting.config,
     );
-    let (thread_id, silent) = match sort {
-        Some(sort) => {
-            let thread_id = sorted_thread(db, tg, &sorting.config, &sort).await?;
-            (thread_id, sorting.config.sorts[&sort].muted)
-        }
-        None => (GENERAL_THREAD, false),
+    let Some(sort) = sort else {
+        let tg_msg = post_inbound(
+            tg,
+            sorting,
+            understood,
+            GENERAL_THREAD,
+            Some(number),
+            false,
+            sms,
+        )
+        .await?;
+        return Ok((GENERAL_THREAD, tg_msg));
     };
-    let tg_msg = post_inbound(
-        tg,
-        sorting,
-        understood,
-        thread_id,
-        Some(number),
-        silent,
-        sms,
-    )
-    .await?;
-    Ok((thread_id, tg_msg))
+    let silent = sorting.config.sorts[&sort].muted;
+    let mut thread_id = sorted_thread(db, tg, &sorting.config, &sort).await?;
+    let mut recreated = false;
+    loop {
+        match post_inbound(
+            tg,
+            sorting,
+            understood,
+            thread_id,
+            Some(number),
+            silent,
+            sms,
+        )
+        .await
+        {
+            Ok(tg_msg) => return Ok((thread_id, tg_msg)),
+            // The user deleted the topic in Telegram: make a new one, once.
+            Err(err) if !recreated && thread_is_gone(&err) => {
+                recreated = true;
+                tracing::warn!(sort = %sort, thread_id, "sorted thread is gone, recreating");
+                thread_id = create_sorted_thread(db, tg, &sorting.config, &sort).await?;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Whether Telegram rejected a post because the forum topic no longer exists.
+fn thread_is_gone(err: &AppError) -> bool {
+    let text = err.to_string().to_lowercase();
+    text.contains("thread not found") || text.contains("topic_deleted")
 }
 
 /// The thread for a Sort, created on first use.
@@ -926,6 +966,16 @@ async fn sorted_thread(
     if let Some(thread_id) = db.sorted_topic(sort)? {
         return Ok(thread_id);
     }
+    create_sorted_thread(db, tg, cfg, sort).await
+}
+
+/// Creates the topic for a Sort and makes it the Sort's thread, replacing any earlier one.
+async fn create_sorted_thread(
+    db: &Db,
+    tg: &dyn TelegramSink,
+    cfg: &SortingConfig,
+    sort: &str,
+) -> Result<i32, AppError> {
     let title = cfg.sorts[sort].title.clone();
     let thread_id = tg.create_topic(title.clone()).await?;
     db.upsert_sorted_topic(sort, thread_id, &title)?;
@@ -2579,6 +2629,73 @@ mod tests {
             .unwrap();
         assert_eq!(tg.rich_posts.lock().unwrap().len(), 1);
         assert_eq!(recorded(&db).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deleted_sorted_thread_is_recreated_and_the_post_retried() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_sorted_topic("promotional", 77, "تبلیغاتی")
+            .unwrap();
+        let tg = FakeTg::new();
+        tg.missing_threads.lock().unwrap().insert(77);
+        let sorting = sorting_with(vec![Ok(stored("promotional", 0.9, &[]))]);
+
+        handle_incoming(
+            &db,
+            "IR",
+            unknown_sms("/sms/1", "off"),
+            &tg,
+            &bus(),
+            &sorting,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(db.sorted_topic("promotional").unwrap(), Some(100));
+        let posts = tg.rich_posts.lock().unwrap();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].0, 100);
+        let rows = recorded(&db);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].thread_id, 100);
+    }
+
+    #[tokio::test]
+    async fn other_post_errors_in_a_sorted_thread_are_not_retried() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_sorted_topic("promotional", 77, "تبلیغاتی")
+            .unwrap();
+        let tg = FakeTg::new();
+        tg.fail.store(true, Ordering::SeqCst);
+        let sorting = sorting_with(vec![Ok(stored("promotional", 0.9, &[]))]);
+
+        assert!(handle_incoming(
+            &db,
+            "IR",
+            unknown_sms("/sms/1", "off"),
+            &tg,
+            &bus(),
+            &sorting
+        )
+        .await
+        .is_err());
+        assert_eq!(db.sorted_topic("promotional").unwrap(), Some(77));
+        assert_eq!(tg.next_thread.load(Ordering::SeqCst), 100);
+    }
+
+    #[test]
+    fn thread_gone_errors_are_recognised() {
+        for text in [
+            "Bad Request: message thread not found",
+            "Bad Request: TOPIC_DELETED",
+            "Bad Request: Message thread not found",
+        ] {
+            assert!(thread_is_gone(&AppError::Telegram(text.into())), "{text}");
+        }
+        assert!(!thread_is_gone(&AppError::Telegram("fail".into())));
+        assert!(!thread_is_gone(&AppError::Telegram(
+            "Bad Request: chat not found".into()
+        )));
     }
 
     #[tokio::test]
