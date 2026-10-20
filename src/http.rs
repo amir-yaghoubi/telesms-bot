@@ -581,6 +581,9 @@ mod tests {
             ws_enabled: false,
             ws_bind: "127.0.0.1".into(),
             ws_port: 8788,
+            classifier_url: None,
+            classifier_model: None,
+            sorting_config_path: None,
         }
     }
 

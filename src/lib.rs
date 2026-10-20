@@ -11,6 +11,7 @@ pub mod modem_mm;
 pub mod normalize;
 pub mod otp;
 pub mod route;
+pub mod sorting;
 pub mod status;
 pub mod telegram;
 pub mod ws;

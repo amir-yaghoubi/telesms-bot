@@ -25,6 +25,9 @@ pub struct Config {
     pub ws_enabled: bool,
     pub ws_bind: String,
     pub ws_port: u16,
+    pub classifier_url: Option<String>,
+    pub classifier_model: Option<String>,
+    pub sorting_config_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Error)]
@@ -112,6 +115,9 @@ impl Config {
                     source: Box::new(e),
                 })?,
             },
+            classifier_url: optional("CLASSIFIER_URL"),
+            classifier_model: optional("CLASSIFIER_MODEL"),
+            sorting_config_path: optional("SORTING_CONFIG_PATH").map(PathBuf::from),
         })
     }
 
@@ -126,6 +132,14 @@ impl Config {
     /// The socket authenticates with the API key, so it needs one.
     pub fn ws_server_enabled(&self) -> bool {
         self.ws_enabled && self.api_enabled()
+    }
+
+    /// The classifier endpoint and model, only when both are configured.
+    pub fn classifier(&self) -> Option<(&str, &str)> {
+        match (&self.classifier_url, &self.classifier_model) {
+            (Some(u), Some(m)) => Some((u.as_str(), m.as_str())),
+            _ => None,
+        }
     }
 }
 
@@ -171,6 +185,10 @@ fn parse_ws_enabled(raw: &str) -> Result<bool, ConfigError> {
     }
 }
 
+fn optional(key: &str) -> Option<String> {
+    env::var(key).ok().filter(|v| !v.trim().is_empty())
+}
+
 fn required(key: &'static str) -> Result<String, ConfigError> {
     env::var(key).map_err(|_| ConfigError::Missing(key))
 }
@@ -213,6 +231,9 @@ mod tests {
         std::env::remove_var("WS_ENABLED");
         std::env::remove_var("WS_BIND");
         std::env::remove_var("WS_PORT");
+        std::env::remove_var("CLASSIFIER_URL");
+        std::env::remove_var("CLASSIFIER_MODEL");
+        std::env::remove_var("SORTING_CONFIG_PATH");
     }
 
     #[test]
@@ -442,5 +463,36 @@ mod tests {
             other => panic!("{other:?}"),
         }
         std::env::remove_var("API_PORT");
+    }
+
+    #[test]
+    fn config_reads_classifier_env() {
+        let _g = ENV_LOCK.lock().unwrap();
+        set_required_env();
+        let c = Config::from_env().unwrap();
+        assert!(c.classifier().is_none());
+        assert!(c.sorting_config_path.is_none());
+
+        std::env::set_var("CLASSIFIER_URL", "http://localhost:8080/v1/systemone");
+        let only_url = Config::from_env().unwrap();
+        assert!(only_url.classifier().is_none());
+
+        std::env::set_var("CLASSIFIER_MODEL", "m.gguf");
+        std::env::set_var("SORTING_CONFIG_PATH", "./sorting.json");
+        let both = Config::from_env().unwrap();
+        assert_eq!(
+            both.classifier(),
+            Some(("http://localhost:8080/v1/systemone", "m.gguf"))
+        );
+        assert_eq!(
+            both.sorting_config_path.as_deref(),
+            Some(std::path::Path::new("./sorting.json"))
+        );
+
+        std::env::set_var("CLASSIFIER_MODEL", "  ");
+        assert!(Config::from_env().unwrap().classifier().is_none());
+        std::env::remove_var("CLASSIFIER_URL");
+        std::env::remove_var("CLASSIFIER_MODEL");
+        std::env::remove_var("SORTING_CONFIG_PATH");
     }
 }
