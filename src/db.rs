@@ -151,7 +151,7 @@ pub struct StoredClassification {
     pub scores: serde_json::Value,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct OtpPatternRow {
     pub id: i64,
     pub name: String,

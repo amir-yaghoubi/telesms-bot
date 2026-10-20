@@ -179,6 +179,7 @@ async fn run_daemon() {
         forward: forward.clone(),
         tg: tg.clone(),
         bus: bus.clone(),
+        sorting: sorting.clone(),
     };
 
     if cfg.api_enabled() {

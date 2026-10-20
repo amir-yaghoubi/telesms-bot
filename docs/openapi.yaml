@@ -5,6 +5,12 @@ info:
   description: |
     JSON API surface for telesms-bot.
     All `/api/v1/*` routes require `X-Api-Key` header.
+
+    Inbound SMS are sorted: `classification` and `otp_code` appear on messages, and `kind` / `sort`
+    on chats. The same two message fields are carried by the WebSocket server's events
+    (`message.received`, `message.sent`, `message.failed`, and `message.updated`, sent when a
+    recorded message changes after it was first announced, for example a late classification or a
+    taught OTP code). The WebSocket protocol itself is described in the README.
 servers:
   - url: http://localhost:8787
     description: Local default
@@ -15,6 +21,7 @@ tags:
   - name: Contacts
   - name: Messaging
   - name: History
+  - name: OTP patterns
 paths:
   /health:
     get:
@@ -326,6 +333,8 @@ paths:
       description: |
         Topics with at least one SMS record, newest activity first.
         Unknown numbers without a contact topic are bucketed into General (`thread_id = 1`).
+        `kind` tells General, Sorted Threads (one per sort, such as promotional), contact topics and
+        bare-number topics apart.
         `unread_count` is always null in v1.
       security:
         - ApiKeyAuth: []
@@ -368,6 +377,8 @@ paths:
         - $ref: "#/components/parameters/HistoryLimit"
         - $ref: "#/components/parameters/HistoryBefore"
         - $ref: "#/components/parameters/HistoryAfter"
+        - $ref: "#/components/parameters/MessageCategory"
+        - $ref: "#/components/parameters/MessageTag"
         - name: number
           in: query
           description: Optional E.164 consistency check against the thread.
@@ -394,6 +405,123 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/IdentityConflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/otp-patterns:
+    get:
+      tags: [OTP patterns]
+      summary: List OTP patterns
+      description: The regexes used to find an OTP code in an inbound SMS, oldest first.
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: Stored patterns
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  patterns:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/OtpPattern"
+                required: [patterns]
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    post:
+      tags: [OTP patterns]
+      summary: Add an OTP pattern
+      description: |
+        The pattern must have exactly one capture group, which holds the code, and a literal
+        letter outside the group, so a pattern that would match almost any number is rejected.
+        Adding a pattern that is already stored returns it unchanged with 200.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OtpPatternRequest"
+      responses:
+        "201":
+          description: Pattern created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OtpPattern"
+        "200":
+          description: The pattern already existed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OtpPattern"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/otp-patterns/{id}:
+    delete:
+      tags: [OTP patterns]
+      summary: Delete an OTP pattern
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+      responses:
+        "204":
+          description: Deleted
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/otp-patterns/learn:
+    post:
+      tags: [OTP patterns]
+      summary: Teach an OTP pattern from a sample
+      description: |
+        Derives a pattern from a sample text and the code in it and stores it.
+        Give exactly one of `message_id` (a recorded inbound message) and `body` (a sample that
+        belongs to no message). With `message_id` the message's OTP code is also set, its Telegram
+        post is refreshed and `message.updated` is announced.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LearnRequest"
+      responses:
+        "200":
+          description: The stored pattern and, for `message_id`, the updated message
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LearnResult"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -429,6 +557,20 @@ components:
       schema:
         type: string
         format: date-time
+    MessageCategory:
+      name: category
+      in: query
+      description: Only messages with this classification category.
+      schema:
+        type: string
+        enum: [transactional, promotional, broadcast, feedback, personal, other]
+    MessageTag:
+      name: tag
+      in: query
+      description: Only messages carrying this classification tag.
+      schema:
+        type: string
+        enum: [scam]
 
   responses:
     Unauthorized:
@@ -718,6 +860,16 @@ components:
           format: int64
           nullable: true
           description: Always null in v1.
+        kind:
+          type: string
+          enum: [general, sorted, contact, number]
+          description: |
+            `general` for thread 1; otherwise `sorted` for a Sorted Thread, `contact` for a
+            contact's topic, `number` for a topic of a bare number.
+        sort:
+          type: string
+          nullable: true
+          description: The sort of a Sorted Thread (for example `promotional`); null otherwise.
       required:
         - thread_id
         - title
@@ -728,6 +880,8 @@ components:
         - last_message_preview
         - last_message_direction
         - unread_count
+        - kind
+        - sort
 
     MessageList:
       type: object
@@ -777,7 +931,95 @@ components:
         status:
           type: string
           enum: [ok, failed]
-      required: [id, direction, e164, body, timestamp, sms_ts, status]
+        classification:
+          allOf:
+            - $ref: "#/components/schemas/Classification"
+          nullable: true
+          description: The sorting decision for an inbound SMS; null when none was made yet.
+        otp_code:
+          type: string
+          nullable: true
+          description: The OTP code found in the SMS; null when none was found.
+      required: [id, direction, e164, body, timestamp, sms_ts, status, classification, otp_code]
+
+    Classification:
+      type: object
+      properties:
+        category:
+          type: string
+          enum: [transactional, promotional, broadcast, feedback, personal, other]
+        confidence:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+        tags:
+          type: array
+          items:
+            type: string
+          description: Extra labels, such as `scam`.
+      required: [category, confidence, tags]
+
+    OtpPattern:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        pattern:
+          type: string
+          description: Regex with exactly one capture group holding the code.
+        created_at:
+          type: string
+          format: date-time
+      required: [id, name, pattern, created_at]
+
+    OtpPatternRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          nullable: true
+          description: Defaults to `pattern-<id>`.
+        pattern:
+          type: string
+      required: [pattern]
+      additionalProperties: false
+
+    LearnRequest:
+      type: object
+      properties:
+        message_id:
+          type: string
+          description: 'Id of a recorded inbound message, "in:<rowid>". "out:" ids are rejected.'
+        body:
+          type: string
+          description: Sample text that belongs to no recorded message.
+        code:
+          type: string
+          description: The OTP code as it appears in the sample.
+        name:
+          type: string
+          nullable: true
+      required: [code]
+      additionalProperties: false
+
+    LearnResult:
+      type: object
+      properties:
+        pattern:
+          $ref: "#/components/schemas/OtpPattern"
+        created:
+          type: boolean
+          description: False when the same pattern was already stored.
+        message:
+          allOf:
+            - $ref: "#/components/schemas/MessageItem"
+          nullable: true
+          description: The updated message when `message_id` was given; null for `body`.
+      required: [pattern, created, message]
 
     StatusLastSms:
       type: object

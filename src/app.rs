@@ -266,6 +266,8 @@ pub struct AppState {
     pub tg: Arc<dyn TelegramSink>,
     /// Where the application layer announces recorded messages.
     pub bus: EventBus,
+    /// The sort config and Classifier, for the OTP learn endpoint.
+    pub sorting: crate::sorting::Sorting,
 }
 
 /// Dependencies the inbox watcher needs, kept together so the watcher and the

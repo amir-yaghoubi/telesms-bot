@@ -251,6 +251,10 @@ command, `send_sms`.
 | `message.received` | An inbound SMS was recorded |
 | `message.sent` | An outbound SMS was delivered |
 | `message.failed` | An outbound SMS failed |
+| `message.updated` | A recorded message changed after it was announced (a late classification or a taught OTP code) |
+
+Event data carries `classification` and `otp_code` (both `null` when absent), the same fields as
+the HTTP API's message items.
 
 Every client receives every event. The server pings every 30 s and closes a client that has sent
 nothing within 60 s. A client that falls behind is disconnected rather than silently missing

@@ -609,6 +609,7 @@ mod tests {
             forward: Arc::new(FakeModem::default()),
             tg: Arc::new(FakeTg::new()),
             bus: bus.clone(),
+            sorting: crate::sorting::Sorting::disabled(),
         };
         (state, modem, bus)
     }
