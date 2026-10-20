@@ -1,7 +1,10 @@
 use teloxide::prelude::*;
-use teloxide::types::{ChatId, MessageId, ReactionType, ReplyParameters, ThreadId};
+use teloxide::types::{
+    ChatId, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode,
+    ReactionType, ReplyParameters, ThreadId,
+};
 
-use crate::app::{AppError, TelegramSink};
+use crate::app::{AppError, RichPost, TelegramSink};
 
 use super::util::forum_thread;
 
@@ -52,5 +55,49 @@ impl TelegramSink for RealTg {
             .map_err(|e| AppError::Telegram(e.to_string()))?;
         let ThreadId(MessageId(id)) = topic.thread_id;
         Ok(id)
+    }
+
+    async fn post_rich(&self, thread_id: i32, post: RichPost) -> Result<i32, AppError> {
+        let mut req = self
+            .bot
+            .send_message(self.chat_id, post.html)
+            .parse_mode(ParseMode::Html)
+            .disable_notification(post.silent);
+        if let Some(thread) = forum_thread(thread_id) {
+            req = req.message_thread_id(thread);
+        }
+        if !post.buttons.is_empty() {
+            let row: Vec<_> = post
+                .buttons
+                .into_iter()
+                .map(|(label, data)| InlineKeyboardButton::callback(label, data))
+                .collect();
+            req = req.reply_markup(InlineKeyboardMarkup::new([row]));
+        }
+        let msg = req.await.map_err(|e| AppError::Telegram(e.to_string()))?;
+        let MessageId(id) = msg.id;
+        Ok(id)
+    }
+
+    async fn edit_html(&self, message_id: i32, html: String) -> Result<(), AppError> {
+        // No reply_markup on an edit removes the inline keyboard.
+        self.bot
+            .edit_message_text(self.chat_id, MessageId(message_id), html)
+            .parse_mode(ParseMode::Html)
+            .await
+            .map_err(|e| AppError::Telegram(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn prompt_reply(&self, thread_id: i32, text: String) -> Result<(), AppError> {
+        let mut req = self
+            .bot
+            .send_message(self.chat_id, text)
+            .reply_markup(ForceReply::new().selective());
+        if let Some(thread) = forum_thread(thread_id) {
+            req = req.message_thread_id(thread);
+        }
+        req.await.map_err(|e| AppError::Telegram(e.to_string()))?;
+        Ok(())
     }
 }

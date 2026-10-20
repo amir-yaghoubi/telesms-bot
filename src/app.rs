@@ -352,6 +352,15 @@ pub const SEND_ACK: &str = "✅";
 pub const SEND_REACT_OK: &str = "👍";
 pub const SEND_FAIL: &str = "👎";
 
+/// A post with HTML, an optional silent flag and one row of inline buttons.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RichPost {
+    pub html: String,
+    pub silent: bool,
+    /// (label, callback data), laid out as one row.
+    pub buttons: Vec<(String, String)>,
+}
+
 #[async_trait::async_trait]
 pub trait TelegramSink: Send + Sync {
     async fn post(&self, thread_id: i32, text: String) -> Result<(), AppError>;
@@ -362,13 +371,29 @@ pub trait TelegramSink: Send + Sync {
         Err(AppError::Telegram("react not supported".into()))
     }
     async fn create_topic(&self, title: String) -> Result<i32, AppError>;
+    /// Posts HTML and returns the Telegram message id.
+    async fn post_rich(&self, _thread_id: i32, _post: RichPost) -> Result<i32, AppError> {
+        Err(AppError::Telegram("post_rich not supported".into()))
+    }
+    /// Replaces a message's text with HTML and drops its inline keyboard.
+    async fn edit_html(&self, _message_id: i32, _html: String) -> Result<(), AppError> {
+        Err(AppError::Telegram("edit_html not supported".into()))
+    }
+    /// Sends a selective force-reply prompt in the thread.
+    async fn prompt_reply(&self, _thread_id: i32, _text: String) -> Result<(), AppError> {
+        Err(AppError::Telegram("prompt_reply not supported".into()))
+    }
 }
 
 pub struct FakeTg {
     pub posts: Mutex<Vec<(i32, String)>>,
     pub replies: Mutex<Vec<(i32, String, i32)>>,
     pub reactions: Mutex<Vec<(i32, String)>>,
+    pub rich_posts: Mutex<Vec<(i32, RichPost)>>,
+    pub edits: Mutex<Vec<(i32, String)>>,
+    pub prompts: Mutex<Vec<(i32, String)>>,
     pub next_thread: AtomicI32,
+    pub next_message: AtomicI32,
     pub fail: AtomicBool,
 }
 
@@ -378,7 +403,11 @@ impl FakeTg {
             posts: Mutex::new(Vec::new()),
             replies: Mutex::new(Vec::new()),
             reactions: Mutex::new(Vec::new()),
+            rich_posts: Mutex::new(Vec::new()),
+            edits: Mutex::new(Vec::new()),
+            prompts: Mutex::new(Vec::new()),
             next_thread: AtomicI32::new(100),
+            next_message: AtomicI32::new(500),
             fail: AtomicBool::new(false),
         }
     }
@@ -430,6 +459,39 @@ impl TelegramSink for FakeTg {
             return Err(AppError::Telegram("fail".into()));
         }
         Ok(self.next_thread.fetch_add(1, Ordering::SeqCst))
+    }
+
+    async fn post_rich(&self, thread_id: i32, post: RichPost) -> Result<i32, AppError> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(AppError::Telegram("fail".into()));
+        }
+        self.rich_posts
+            .lock()
+            .expect("fake tg rich posts lock")
+            .push((thread_id, post));
+        Ok(self.next_message.fetch_add(1, Ordering::SeqCst))
+    }
+
+    async fn edit_html(&self, message_id: i32, html: String) -> Result<(), AppError> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(AppError::Telegram("fail".into()));
+        }
+        self.edits
+            .lock()
+            .expect("fake tg edits lock")
+            .push((message_id, html));
+        Ok(())
+    }
+
+    async fn prompt_reply(&self, thread_id: i32, text: String) -> Result<(), AppError> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(AppError::Telegram("fail".into()));
+        }
+        self.prompts
+            .lock()
+            .expect("fake tg prompts lock")
+            .push((thread_id, text));
+        Ok(())
     }
 }
 
@@ -1245,6 +1307,37 @@ mod tests {
         assert_eq!(
             tg.reactions.lock().unwrap().as_slice(),
             &[(7, SEND_PENDING.into()), (7, SEND_REACT_OK.into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_tg_records_rich_posts_with_ids() {
+        let tg = FakeTg::new();
+        let first = RichPost {
+            html: "<b>a</b>".into(),
+            silent: true,
+            buttons: vec![("Move".into(), "mv:1".into())],
+        };
+        let second = RichPost {
+            html: "b".into(),
+            silent: false,
+            buttons: vec![],
+        };
+        assert_eq!(tg.post_rich(7, first.clone()).await.unwrap(), 500);
+        assert_eq!(tg.post_rich(8, second.clone()).await.unwrap(), 501);
+        assert_eq!(
+            tg.rich_posts.lock().unwrap().as_slice(),
+            &[(7, first), (8, second)]
+        );
+        tg.edit_html(500, "<i>x</i>".into()).await.unwrap();
+        tg.prompt_reply(7, "name?".into()).await.unwrap();
+        assert_eq!(
+            tg.edits.lock().unwrap().as_slice(),
+            &[(500, "<i>x</i>".into())]
+        );
+        assert_eq!(
+            tg.prompts.lock().unwrap().as_slice(),
+            &[(7, "name?".into())]
         );
     }
 
