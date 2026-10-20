@@ -1,15 +1,16 @@
 use super::handlers::{
     handle_help, handle_ignore, handle_num_callback, handle_number_empty_or_list, handle_open,
-    handle_pending_forward_text, handle_search, handle_sms, handle_who,
+    handle_otp_command, handle_pending_forward_text, handle_search, handle_sms,
+    handle_teach_callback, handle_teach_reply, handle_who,
 };
 use super::keyboards::{
     forward_keyboard, inline_answer_articles, inline_articles, search_keyboard,
 };
 use super::parse::{
-    allow_dm_callback, allowed, bot_commands, format_who, help_text, is_owner_dm,
-    parse_cf_callback, parse_cmd_name, parse_ignore_reply, parse_num_callback, parse_open_callback,
-    parse_open_cmd, parse_search_query, parse_sms_cmd, parse_status_refresh, topic_open_message,
-    CfAction,
+    allow_dm_callback, allowed, bot_commands, format_who, help_text, is_otp_teach_callback,
+    is_owner_dm, parse_cf_callback, parse_cmd_name, parse_ignore_reply, parse_num_callback,
+    parse_open_callback, parse_open_cmd, parse_otp_cmd, parse_search_query, parse_sms_cmd,
+    parse_status_refresh, parse_teach_prompt, teach_prompt, topic_open_message, CfAction,
 };
 use super::util::{edit_failed_is_noop, forum_thread};
 use crate::app::FakeTg;
@@ -19,6 +20,7 @@ use crate::db::{Contact, Db, Topic};
 use crate::events::EventBus;
 use crate::modem::{FakeModem, SmsModem};
 use crate::route::GENERAL_THREAD;
+use crate::sorting::config::SortingConfig;
 use teloxide::{ApiError, RequestError};
 
 /// A bus to announce through; tests that do not care ignore it.
@@ -869,7 +871,7 @@ fn bot_commands_are_the_forum_menu() {
     let names: Vec<&str> = cmds.iter().map(|c| c.command.as_str()).collect();
     assert_eq!(
         names.as_slice(),
-        &["help", "sms", "search", "who", "number", "ignore", "forward", "status"]
+        &["help", "sms", "search", "who", "number", "ignore", "forward", "status", "otp"]
     );
     assert_eq!(cmds[0].description, "How to send SMS and use this group");
     assert_eq!(cmds[1].description, "Send SMS: /sms <number> <text>");
@@ -885,6 +887,10 @@ fn bot_commands_are_the_forum_menu() {
     );
     assert_eq!(cmds[6].description, "Manage unconditional call forwarding");
     assert_eq!(cmds[7].description, "Modem and gateway status");
+    assert_eq!(
+        cmds[8].description,
+        "Reply to an SMS with /otp <code> to teach its code"
+    );
 }
 
 #[test]
@@ -922,6 +928,9 @@ SMS from this forum.
   Modem, SIM, today's SMS counts, last in/out, contacts.
   Works in any topic and in a private chat with the bot.
 
+/otp <code>
+  Reply to an SMS with its one-time code to teach the bot that format.
+
 Typing in a contact topic sends SMS to that contact's default number.
 Text in General is not an SMS unless you use /sms."
     );
@@ -952,4 +961,179 @@ async fn help_posts_guide_in_same_thread() {
         tg.posts.lock().unwrap().as_slice(),
         &[(9, help_text().to_string())]
     );
+}
+
+fn sorting_cfg() -> SortingConfig {
+    SortingConfig::load(None).unwrap()
+}
+
+/// An inbound SMS posted in General as Telegram message 77.
+fn teachable(db: &Db) -> String {
+    db.record_inbound(
+        "/sms/1",
+        "+98912",
+        "کد ورود: 5388",
+        Some(77),
+        "",
+        1,
+        None,
+        None,
+    )
+    .unwrap()
+    .id
+}
+
+#[test]
+fn parses_otp_command() {
+    assert_eq!(parse_otp_cmd("/otp 402332").as_deref(), Some("402332"));
+    assert_eq!(
+        parse_otp_cmd("/otp@mybot ۴۰۲۳۳۲").as_deref(),
+        Some("402332")
+    );
+    assert_eq!(parse_otp_cmd("/otp ٤٠٢٣٣٢").as_deref(), Some("402332"));
+    assert_eq!(parse_otp_cmd("/otp abc"), None);
+    assert_eq!(parse_otp_cmd("/otp"), None);
+    assert_eq!(parse_otp_cmd("/otpx 123"), None);
+    assert_eq!(parse_otp_cmd("/sms 123"), None);
+}
+
+#[test]
+fn teach_prompt_round_trips() {
+    assert_eq!(teach_prompt(123), "Reply with the code for message in:123");
+    assert_eq!(parse_teach_prompt(&teach_prompt(123)), Some(123));
+    assert_eq!(parse_teach_prompt("hello"), None);
+    assert_eq!(
+        parse_teach_prompt("Reply with the code for message in:x"),
+        None
+    );
+}
+
+#[test]
+fn recognizes_teach_callback() {
+    assert!(is_otp_teach_callback("otp:teach"));
+    assert!(!is_otp_teach_callback("otp:other"));
+    assert!(!is_otp_teach_callback("st:r"));
+}
+
+#[test]
+fn help_and_commands_mention_otp() {
+    assert!(bot_commands().iter().any(|c| c.command == "otp"));
+    assert!(help_text().contains("/otp"));
+}
+
+#[tokio::test]
+async fn otp_reply_on_unrecorded_post_answers_not_found() {
+    let db = Db::open_in_memory().unwrap();
+    let tg = FakeTg::new();
+    handle_otp_command(&db, &tg, &bus(), &sorting_cfg(), 9, Some(404), "/otp 5388")
+        .await
+        .unwrap();
+    assert_eq!(
+        tg.posts.lock().unwrap().as_slice(),
+        &[(9, "Message not found".into())]
+    );
+    assert!(tg.edits.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn otp_command_not_a_reply_posts_usage() {
+    let db = Db::open_in_memory().unwrap();
+    let tg = FakeTg::new();
+    handle_otp_command(&db, &tg, &bus(), &sorting_cfg(), 9, None, "/otp 5388")
+        .await
+        .unwrap();
+    let posts = tg.posts.lock().unwrap();
+    assert_eq!(posts.len(), 1);
+    assert!(posts[0].1.contains("Reply to an SMS with /otp <code>"));
+}
+
+#[tokio::test]
+async fn otp_reply_learns_and_edits_post() {
+    let db = Db::open_in_memory().unwrap();
+    teachable(&db);
+    let tg = FakeTg::new();
+    handle_otp_command(&db, &tg, &bus(), &sorting_cfg(), 1, Some(77), "/otp ۵۳۸۸")
+        .await
+        .unwrap();
+    let posts = tg.posts.lock().unwrap();
+    assert_eq!(posts.len(), 1);
+    assert!(posts[0].1.starts_with("Learned pattern "));
+    assert!(tg.edits.lock().unwrap()[0].1.contains("<code>5388</code>"));
+}
+
+#[tokio::test]
+async fn otp_reply_with_wrong_code_posts_pattern_error() {
+    let db = Db::open_in_memory().unwrap();
+    teachable(&db);
+    let tg = FakeTg::new();
+    handle_otp_command(&db, &tg, &bus(), &sorting_cfg(), 1, Some(77), "/otp 1111")
+        .await
+        .unwrap();
+    assert_eq!(
+        tg.posts.lock().unwrap().as_slice(),
+        &[(1, "code '1111' not found in text".into())]
+    );
+}
+
+#[tokio::test]
+async fn teach_callback_prompts_for_the_code() {
+    let db = Db::open_in_memory().unwrap();
+    let id = teachable(&db);
+    let tg = FakeTg::new();
+    handle_teach_callback(&db, &tg, 1, 77).await.unwrap();
+    assert_eq!(
+        tg.prompts.lock().unwrap().as_slice(),
+        &[(1, format!("Reply with the code for message {id}"))]
+    );
+}
+
+#[tokio::test]
+async fn teach_callback_on_unrecorded_post_answers_not_found() {
+    let db = Db::open_in_memory().unwrap();
+    let tg = FakeTg::new();
+    handle_teach_callback(&db, &tg, 1, 404).await.unwrap();
+    assert!(tg.prompts.lock().unwrap().is_empty());
+    assert_eq!(
+        tg.posts.lock().unwrap().as_slice(),
+        &[(1, "Message not found".into())]
+    );
+}
+
+#[tokio::test]
+async fn digits_reply_to_teach_prompt_learns() {
+    let db = Db::open_in_memory().unwrap();
+    let id = teachable(&db);
+    let tg = FakeTg::new();
+    let consumed = handle_teach_reply(
+        &db,
+        &tg,
+        &bus(),
+        &sorting_cfg(),
+        1,
+        &format!("Reply with the code for message {id}"),
+        "۵۳۸۸",
+    )
+    .await
+    .unwrap();
+    assert!(consumed);
+    assert!(tg.edits.lock().unwrap()[0].1.contains("<code>5388</code>"));
+    assert!(tg.posts.lock().unwrap()[0]
+        .1
+        .starts_with("Learned pattern "));
+}
+
+#[tokio::test]
+async fn non_digit_reply_or_other_parent_is_not_consumed() {
+    let db = Db::open_in_memory().unwrap();
+    let id = teachable(&db);
+    let tg = FakeTg::new();
+    let prompt = format!("Reply with the code for message {id}");
+    for (parent, text) in [(prompt.as_str(), "hello"), ("some other message", "5388")] {
+        let consumed = handle_teach_reply(&db, &tg, &bus(), &sorting_cfg(), 1, parent, text)
+            .await
+            .unwrap();
+        assert!(!consumed);
+    }
+    assert!(tg.posts.lock().unwrap().is_empty());
+    assert!(tg.edits.lock().unwrap().is_empty());
 }

@@ -2,6 +2,7 @@ pub mod classifier;
 pub mod config;
 pub mod decide;
 pub mod guard;
+pub mod learn;
 pub mod render;
 
 use std::sync::Arc;

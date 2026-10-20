@@ -6,7 +6,7 @@ use teloxide::types::{
 
 use crate::app::{AppError, RichPost, TelegramSink};
 
-use super::util::forum_thread;
+use super::util::{edit_failed_is_noop, forum_thread};
 
 pub struct RealTg {
     pub bot: teloxide::Bot,
@@ -85,8 +85,14 @@ impl TelegramSink for RealTg {
             .edit_message_text(self.chat_id, MessageId(message_id), html)
             .parse_mode(ParseMode::Html)
             .await
-            .map_err(|e| AppError::Telegram(e.to_string()))?;
-        Ok(())
+            .map(|_| ())
+            .or_else(|e| {
+                if edit_failed_is_noop(&e) {
+                    Ok(())
+                } else {
+                    Err(AppError::Telegram(e.to_string()))
+                }
+            })
     }
 
     async fn prompt_reply(&self, thread_id: i32, text: String) -> Result<(), AppError> {
