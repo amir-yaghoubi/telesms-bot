@@ -91,6 +91,16 @@ async fn classify_cli() {
     if report.stopped_by_breaker {
         eprintln!("classifier unreachable; stopped early");
     }
+    std::process::exit(classify_exit_code(&report));
+}
+
+/// 0 when the run finished, 3 when the breaker stopped it early.
+fn classify_exit_code(report: &telesms_bot::sorting::sweep::SweepReport) -> i32 {
+    if report.stopped_by_breaker {
+        3
+    } else {
+        0
+    }
 }
 
 async fn check_modem() {
@@ -251,4 +261,25 @@ async fn run_daemon() {
         while tasks.join_next().await.is_some() {}
     })
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use telesms_bot::sorting::sweep::SweepReport;
+
+    #[test]
+    fn classify_exits_3_only_when_the_breaker_stopped_it() {
+        let done = SweepReport {
+            classified: 2,
+            failed: 1,
+            stopped_by_breaker: false,
+        };
+        assert_eq!(classify_exit_code(&done), 0);
+        let stopped = SweepReport {
+            stopped_by_breaker: true,
+            ..done
+        };
+        assert_eq!(classify_exit_code(&stopped), 3);
+    }
 }

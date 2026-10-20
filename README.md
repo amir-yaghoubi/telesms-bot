@@ -370,7 +370,8 @@ telesms-bot classify --failed     # messages marked failed
 telesms-bot classify --force      # every message, including already classified
 ```
 
-It prints `classified N, failed M`, and stops early if the classifier is unreachable.
+It prints `classified N, failed M`, and stops early if the classifier is unreachable. It exits with
+code 3 when it stopped early, so scripts can tell a partial run from a finished one.
 
 ### API and WebSocket
 
