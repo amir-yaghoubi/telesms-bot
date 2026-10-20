@@ -13,11 +13,32 @@ use super::parse::{
 };
 use super::util::{edit_failed_is_noop, forum_thread};
 use crate::app::FakeTg;
+use crate::app::{SendContext, TelegramSink};
 use crate::config::Config;
 use crate::db::{Contact, Db, Topic};
-use crate::modem::FakeModem;
+use crate::events::EventBus;
+use crate::modem::{FakeModem, SmsModem};
 use crate::route::GENERAL_THREAD;
 use teloxide::{ApiError, RequestError};
+
+/// A bus to announce through; tests that do not care ignore it.
+fn bus() -> EventBus {
+    EventBus::new(16)
+}
+
+/// A send context for tests.
+fn send_context<'a>(
+    modem: &'a dyn SmsModem,
+    tg: &'a dyn TelegramSink,
+    bus: &'a EventBus,
+) -> SendContext<'a> {
+    SendContext {
+        modem,
+        tg,
+        bus,
+        delete_enabled: true,
+    }
+}
 
 fn sample_cfg() -> Config {
     use std::time::Duration;
@@ -39,6 +60,9 @@ fn sample_cfg() -> Config {
         api_key: None,
         api_bind: "0.0.0.0".into(),
         api_port: 8787,
+        ws_enabled: false,
+        ws_bind: "127.0.0.1".into(),
+        ws_port: 8788,
     }
 }
 
@@ -170,9 +194,7 @@ async fn sms_known_contact_creates_topic_sends_and_acks() {
         "hello",
         1,
         Some(7),
-        &modem,
-        &tg,
-        true,
+        &send_context(&modem, &tg, &bus()),
     )
     .await
     .unwrap();
@@ -250,7 +272,8 @@ async fn num_callback_sets_default_and_posts() {
     })
     .unwrap();
     let tg = FakeTg::new();
-    handle_num_callback(&db, "IR", 9, "+98912", None, &tg, true)
+    let modem = FakeModem::default();
+    handle_num_callback(&db, "IR", 9, "+98912", &send_context(&modem, &tg, &bus()))
         .await
         .unwrap();
     assert_eq!(
@@ -284,9 +307,15 @@ async fn num_callback_sends_pending_text() {
     db.set_pending_outbound(9, "hello", Some(11)).unwrap();
     let tg = FakeTg::new();
     let modem = FakeModem::default();
-    handle_num_callback(&db, "IR", 9, "+989188086139", Some(&modem), &tg, true)
-        .await
-        .unwrap();
+    handle_num_callback(
+        &db,
+        "IR",
+        9,
+        "+989188086139",
+        &send_context(&modem, &tg, &bus()),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         modem.sent.lock().unwrap().as_slice(),
         &[("+989188086139".into(), "hello".into())]
@@ -384,7 +413,8 @@ async fn num_callback_avoids_identity_conflict() {
     })
     .unwrap();
     let tg = FakeTg::new();
-    handle_num_callback(&db, "IR", 9, "+98913", None, &tg, true)
+    let modem = FakeModem::default();
+    handle_num_callback(&db, "IR", 9, "+98913", &send_context(&modem, &tg, &bus()))
         .await
         .unwrap();
     assert_eq!(
@@ -430,9 +460,7 @@ async fn sms_ignored_number_stays_in_general() {
         "hello",
         1,
         Some(7),
-        &modem,
-        &tg,
-        true,
+        &send_context(&modem, &tg, &bus()),
     )
     .await
     .unwrap();
@@ -469,9 +497,17 @@ async fn sms_does_not_apply_incoming_default() {
     .unwrap();
     let tg = FakeTg::new();
     let modem = FakeModem::default();
-    handle_sms(&db, "IR", b, "hello", 1, Some(7), &modem, &tg, true)
-        .await
-        .unwrap();
+    handle_sms(
+        &db,
+        "IR",
+        b,
+        "hello",
+        1,
+        Some(7),
+        &send_context(&modem, &tg, &bus()),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         db.get_topic_by_thread(42)
             .unwrap()
@@ -509,9 +545,7 @@ async fn sms_send_ok_deletes_path() {
         "hello",
         1,
         None,
-        &modem,
-        &tg,
-        true,
+        &send_context(&modem, &tg, &bus()),
     )
     .await
     .unwrap();
@@ -539,9 +573,7 @@ async fn sms_send_err_does_not_delete() {
         "hello",
         1,
         None,
-        &modem,
-        &tg,
-        true,
+        &send_context(&modem, &tg, &bus()),
     )
     .await
     .unwrap();

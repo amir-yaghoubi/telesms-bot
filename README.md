@@ -217,6 +217,54 @@ Then open `http://localhost:8080`.
 
 ---
 
+## Realtime (WebSocket)
+
+Opt-in second transport for clients that want messages as they arrive instead of polling. Start it
+with `WS_ENABLED=true`; it listens on `127.0.0.1:8788` unless `WS_BIND` / `WS_PORT` say otherwise.
+The socket authenticates with the same key as the API: send it in the `X-Api-Key` header, or as
+`?api_key=` for clients that cannot set headers (browsers).
+
+```bash
+WS_ENABLED=true API_KEY=secret cargo run
+websocat -H="X-Api-Key: secret" ws://127.0.0.1:8788/
+```
+
+Frames are JSON text. The server sends events for every recorded message; the client may send one
+command, `send_sms`.
+
+```jsonc
+// server -> client
+{"v":1,"type":"message.received","data":{"id":"in:12","direction":"in","e164":"+989121234567","body":"hello","timestamp":"2026-10-20T10:00:00.123+00:00","sms_ts":"2026-10-20T09:59:58+00:00","status":"ok","thread_id":9}}
+{"v":1,"type":"message.sent","data":{…}}       // outbound, delivered
+{"v":1,"type":"message.failed","data":{…}}     // outbound, failed
+
+// client -> server
+{"v":1,"type":"send_sms","id":"c1","data":{"number":"+989121234567","text":"hi"}}
+
+// server -> client
+{"v":1,"type":"ack","id":"c1","data":{"e164":"+989121234567","thread_id":9,"sent":true}}
+{"v":1,"type":"error","id":"c1","error":"need_default_number","message":"need default number","numbers":["+98912…"]}
+```
+
+| Event | When |
+|---|---|
+| `message.received` | An inbound SMS was recorded |
+| `message.sent` | An outbound SMS was delivered |
+| `message.failed` | An outbound SMS failed |
+
+Every client receives every event. The server pings every 30 s and closes a client that has sent
+nothing within 60 s. A client that falls behind is disconnected rather than silently missing
+messages: reconnect with `?after=<timestamp>` to have the gateway replay what was missed.
+
+```bash
+websocat -H="X-Api-Key: secret" "ws://127.0.0.1:8788/?after=2026-10-20T09:00:00%2B00:00"
+```
+
+Decisions behind this transport: [ADR 0001](docs/adr/0001-websocket-realtime.md). Vocabulary:
+[CONTEXT.md](CONTEXT.md).
+
+---
+
 ## Configuration
 
 Required and common variables (see `.env.example`):
@@ -233,6 +281,9 @@ Required and common variables (see `.env.example`):
 | `DEFAULT_REGION` | Phone parsing region (default `IR`) |
 | `CONTACTS_SYNC_INTERVAL_SECS` | Default `21600` (6 h) |
 | `SMS_DELETE_ENABLED` | Delete handled SMS from the modem (default `true`) |
+| `API_KEY` | Key for the HTTP API and the WebSocket server (unset = both off) |
+| `WS_ENABLED` | Start the WebSocket server (default `false`) |
+| `WS_BIND` / `WS_PORT` | WebSocket listener (default `127.0.0.1:8788`) |
 
 Any ModemManager-managed stick should work if `MODEM_UID` equals that
 modem’s `System.device` field. The DWM-222 preset uses UID `dwm222`.

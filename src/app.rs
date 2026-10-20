@@ -6,10 +6,11 @@ use futures_util::StreamExt;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+use crate::actions::ActionError;
 use crate::db::{Db, Topic};
+use crate::events::{EventBus, MessageEvent};
 use crate::google::{ContactsSync, GoogleError};
 use crate::modem::{IncomingSms, ModemError, ModemInfo, SmsInbox, SmsModem};
-use crate::actions::ActionError;
 use crate::modem_mm::MmModem;
 use crate::normalize::normalize_e164;
 use crate::route::{plan_outbound, route_for_send, route_inbound, InboundDest, OutboundPlan, GENERAL_THREAD};
@@ -225,12 +226,57 @@ pub async fn watch_contacts(
     }
 }
 
+/// The dependencies a send needs besides the message itself.
+///
+/// A send always touches the modem, the Telegram sink and the event bus, so
+/// they travel together instead of as a growing argument list.
+#[derive(Clone, Copy)]
+pub struct SendContext<'a> {
+    pub modem: &'a dyn SmsModem,
+    pub tg: &'a dyn TelegramSink,
+    /// Where the sent message is announced.
+    pub bus: &'a EventBus,
+    pub delete_enabled: bool,
+}
+
+/// Owned send dependencies, for callers that keep them around.
+#[derive(Clone)]
+pub struct SendDeps {
+    pub modem: Arc<dyn SmsModem>,
+    /// Where the sent message is announced.
+    pub bus: EventBus,
+}
+
+/// State the daemon's transports share.
+///
+/// The HTTP API and the WebSocket server both work against the same modem,
+/// database, Telegram sink and event bus.
+#[derive(Clone)]
+pub struct AppState {
+    pub cfg: crate::config::Config,
+    pub db: Arc<Db>,
+    pub modem: Arc<dyn SmsModem>,
+    pub info: Arc<dyn ModemInfo>,
+    pub forward: Arc<dyn crate::modem::CallForward>,
+    pub tg: Arc<dyn TelegramSink>,
+    /// Where the application layer announces recorded messages.
+    pub bus: EventBus,
+}
+
+/// Dependencies the inbox watcher needs, kept together so the watcher and the
+/// functions it drives stay readable.
+pub struct InboxWatch {
+    pub db: Arc<Db>,
+    pub region: String,
+    pub tg: Arc<dyn TelegramSink>,
+    pub delete_enabled: bool,
+    /// Where the watcher announces the messages it handles.
+    pub bus: EventBus,
+}
+
 pub async fn watch_inbox<I>(
     inbox: Arc<I>,
-    db: Arc<Db>,
-    region: String,
-    tg: Arc<dyn TelegramSink>,
-    delete_enabled: bool,
+    watch: InboxWatch,
     cancel: CancellationToken,
     retry: Duration,
 ) where
@@ -244,11 +290,12 @@ pub async fn watch_inbox<I>(
             Ok(stream) => {
                 drain_listed_sms(
                     inbox.as_ref(),
-                    db.as_ref(),
-                    &region,
-                    tg.as_ref(),
-                    delete_enabled,
+                    watch.db.as_ref(),
+                    &watch.region,
+                    watch.tg.as_ref(),
+                    watch.delete_enabled,
                     &cancel,
+                    &watch.bus,
                 )
                 .await;
                 let mut stream = std::pin::pin!(stream);
@@ -258,11 +305,12 @@ pub async fn watch_inbox<I>(
                         _ = tokio::time::sleep(retry) => {
                             drain_listed_sms(
                                 inbox.as_ref(),
-                                db.as_ref(),
-                                &region,
-                                tg.as_ref(),
-                                delete_enabled,
+                                watch.db.as_ref(),
+                                &watch.region,
+                                watch.tg.as_ref(),
+                                watch.delete_enabled,
                                 &cancel,
+                                &watch.bus,
                             )
                             .await;
                         }
@@ -272,12 +320,13 @@ pub async fn watch_inbox<I>(
                                 break;
                             };
                             if let Err(err) = handle_incoming_then_delete(
-                                &db,
-                                &region,
+                                watch.db.as_ref(),
+                                &watch.region,
                                 sms,
-                                tg.as_ref(),
+                                watch.tg.as_ref(),
                                 inbox.as_ref(),
-                                delete_enabled,
+                                watch.delete_enabled,
+                                &watch.bus,
                             )
                             .await
                             {
@@ -391,6 +440,7 @@ async fn drain_listed_sms<I>(
     tg: &dyn TelegramSink,
     delete_enabled: bool,
     cancel: &CancellationToken,
+    bus: &EventBus,
 ) where
     I: SmsInbox,
 {
@@ -404,7 +454,8 @@ async fn drain_listed_sms<I>(
                     return;
                 }
                 if let Err(err) =
-                    handle_incoming_then_delete(db, region, sms, tg, inbox, delete_enabled).await
+                    handle_incoming_then_delete(db, region, sms, tg, inbox, delete_enabled, bus)
+                        .await
                 {
                     tracing::error!(error = %err, "existing sms");
                 }
@@ -432,6 +483,7 @@ pub async fn handle_incoming_then_delete(
     tg: &dyn TelegramSink,
     modem: &dyn SmsModem,
     delete_enabled: bool,
+    bus: &EventBus,
 ) -> Result<(), AppError> {
     if sms.inbound && sms.text.is_empty() {
         tracing::info!(
@@ -442,7 +494,7 @@ pub async fn handle_incoming_then_delete(
         return Ok(());
     }
     let path = sms.path.clone();
-    match handle_incoming(db, region, sms, tg).await {
+    match handle_incoming(db, region, sms, tg, bus).await {
         Ok(()) => {
             maybe_delete(delete_enabled, modem, &path).await;
             Ok(())
@@ -456,6 +508,7 @@ pub async fn handle_incoming(
     region: &str,
     sms: IncomingSms,
     tg: &dyn TelegramSink,
+    bus: &EventBus,
 ) -> Result<(), AppError> {
     if !sms.inbound {
         return Ok(());
@@ -474,39 +527,18 @@ pub async fn handle_incoming(
             InboundDest::ExistingTopic { thread_id, .. } => thread_id,
             InboundDest::CreateContactTopic { .. } | InboundDest::General { .. } => GENERAL_THREAD,
         };
-        db.record_inbound(
-            &sms.path,
-            &id_e164,
-            &sms.text,
-            None,
-            &sms.timestamp,
-            thread_id,
-        )?;
+        announce_inbound(db, bus, &sms, &id_e164, thread_id)?;
         return Ok(());
     }
 
     match deliver_incoming(db, region, &sms, tg).await {
         Ok(Delivered::Normalized { e164, thread_id }) => {
             db.mark_incoming(&e164)?;
-            db.record_inbound(
-                &sms.path,
-                &e164,
-                &sms.text,
-                None,
-                &sms.timestamp,
-                thread_id,
-            )?;
+            announce_inbound(db, bus, &sms, &e164, thread_id)?;
             Ok(())
         }
         Ok(Delivered::Raw { thread_id }) => {
-            db.record_inbound(
-                &sms.path,
-                &id_e164,
-                &sms.text,
-                None,
-                &sms.timestamp,
-                thread_id,
-            )?;
+            announce_inbound(db, bus, &sms, &id_e164, thread_id)?;
             Ok(())
         }
         Err(err) => {
@@ -521,6 +553,19 @@ pub async fn handle_incoming(
             Err(err)
         }
     }
+}
+
+/// Record an inbound SMS and announce it to realtime subscribers.
+fn announce_inbound(
+    db: &Db,
+    bus: &EventBus,
+    sms: &IncomingSms,
+    e164: &str,
+    thread_id: i32,
+) -> Result<(), AppError> {
+    let row = db.record_inbound(&sms.path, e164, &sms.text, None, &sms.timestamp, thread_id)?;
+    bus.publish(MessageEvent::from(row));
+    Ok(())
 }
 
 pub(crate) fn parse_sms_timestamp(ts: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
@@ -696,10 +741,14 @@ pub async fn send_and_ack(
     text: &str,
     thread_id: i32,
     reply_to: Option<i32>,
-    modem: &dyn SmsModem,
-    tg: &dyn TelegramSink,
-    delete_enabled: bool,
+    ctx: &SendContext<'_>,
 ) -> Result<(), ActionError> {
+    let SendContext {
+        modem,
+        tg,
+        bus,
+        delete_enabled,
+    } = *ctx;
     if let Some(id) = reply_to {
         if let Err(err) = tg.react(id, SEND_PENDING).await {
             return Err(ActionError::TelegramFailed {
@@ -711,7 +760,8 @@ pub async fn send_and_ack(
 
     match modem.send(e164, text).await {
         Ok(path) => {
-            db.record_outbound(e164, text, "ok", thread_id)?;
+            let row = db.record_outbound(e164, text, "ok", thread_id)?;
+            bus.publish(MessageEvent::from(row));
             let ack_result = match reply_to {
                 Some(id) => tg.react(id, SEND_REACT_OK).await,
                 None => ack_send(tg, thread_id, SEND_ACK, None).await,
@@ -727,7 +777,8 @@ pub async fn send_and_ack(
         }
         Err(err) => {
             let err_s = err.to_string();
-            db.record_outbound(e164, text, &err_s, thread_id)?;
+            let row = db.record_outbound(e164, text, &err_s, thread_id)?;
+            bus.publish(MessageEvent::from(row));
             if let Some(id) = reply_to {
                 let _ = tg.react(id, SEND_FAIL).await;
             }
@@ -743,9 +794,7 @@ pub async fn handle_owner_text(
     thread_id: i32,
     text: &str,
     reply_to: Option<i32>,
-    modem: &dyn SmsModem,
-    tg: &dyn TelegramSink,
-    delete_enabled: bool,
+    ctx: &SendContext<'_>,
 ) -> Result<OwnerTextOutcome, AppError> {
     let _ = region;
     if text.starts_with('/') {
@@ -758,18 +807,7 @@ pub async fn handle_owner_text(
             Ok(OwnerTextOutcome::NeedNumber(numbers))
         }
         OutboundPlan::Send { e164 } => {
-            match send_and_ack(
-                db,
-                &e164,
-                text,
-                thread_id,
-                reply_to,
-                modem,
-                tg,
-                delete_enabled,
-            )
-            .await
-            {
+            match send_and_ack(db, &e164, text, thread_id, reply_to, ctx).await {
                 Ok(()) => {}
                 Err(ActionError::ModemFailed(_)) => {}
                 Err(ActionError::Db(e)) => return Err(e.into()),
@@ -787,6 +825,122 @@ mod tests {
     use crate::modem::FakeModem;
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicUsize;
+
+    /// A bus to announce through; tests that do not care ignore it.
+    fn bus() -> EventBus {
+        EventBus::new(16)
+    }
+
+    /// A send context for tests.
+    fn send_context<'a>(
+        modem: &'a dyn SmsModem,
+        tg: &'a dyn TelegramSink,
+        bus: &'a EventBus,
+    ) -> SendContext<'a> {
+        SendContext {
+            modem,
+            tg,
+            bus,
+            delete_enabled: true,
+        }
+    }
+
+    /// A send context that leaves the sent SMS on the modem.
+    fn send_context_without_delete<'a>(
+        modem: &'a dyn SmsModem,
+        tg: &'a dyn TelegramSink,
+        bus: &'a EventBus,
+    ) -> SendContext<'a> {
+        SendContext {
+            modem,
+            tg,
+            bus,
+            delete_enabled: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_inbound_sms_is_announced() {
+        let db = Db::open_in_memory().unwrap();
+        let tg = FakeTg::new();
+        let bus = bus();
+        let mut events = bus.subscribe();
+
+        handle_incoming(
+            &db,
+            "IR",
+            IncomingSms {
+                path: "/sms/1".into(),
+                e164: "+989120000001".into(),
+                text: "hi".into(),
+                inbound: true,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            },
+            &tg,
+            &bus,
+        )
+        .await
+        .unwrap();
+
+        let event = events.try_recv().expect("announced");
+        assert_eq!(event.direction, "in");
+        assert_eq!(event.e164, "+989120000001");
+        assert_eq!(event.body, "hi");
+        assert_eq!(event.status, "ok");
+    }
+
+    #[tokio::test]
+    async fn an_outbound_sms_is_announced_with_its_status() {
+        let db = Db::open_in_memory().unwrap();
+        let tg = FakeTg::new();
+        let modem = FakeModem::default();
+        let bus = bus();
+        let mut events = bus.subscribe();
+
+        send_and_ack(
+            &db,
+            "+989120000001",
+            "hi",
+            1,
+            None,
+            &send_context(&modem, &tg, &bus),
+        )
+        .await
+        .unwrap();
+
+        let event = events.try_recv().expect("announced");
+        assert_eq!(event.direction, "out");
+        assert_eq!(event.e164, "+989120000001");
+        assert_eq!(event.body, "hi");
+        assert_eq!(event.status, "ok");
+    }
+
+    #[tokio::test]
+    async fn a_failed_outbound_sms_is_announced_as_failed() {
+        let db = Db::open_in_memory().unwrap();
+        let tg = FakeTg::new();
+        let modem = FakeModem {
+            fail: true,
+            ..FakeModem::default()
+        };
+        let bus = bus();
+        let mut events = bus.subscribe();
+
+        let err = send_and_ack(
+            &db,
+            "+989120000001",
+            "hi",
+            1,
+            None,
+            &send_context(&modem, &tg, &bus),
+        )
+        .await;
+        assert!(err.is_err());
+
+        let event = events.try_recv().expect("announced");
+        assert_eq!(event.direction, "out");
+        assert_eq!(event.status, "failed");
+    }
 
     #[tokio::test]
     async fn incoming_known_contact_creates_topic_and_posts_body() {
@@ -806,6 +960,7 @@ mod tests {
                 timestamp: chrono::Utc::now().to_rfc3339(),
             },
             &tg,
+            &bus(),
         )
         .await
         .unwrap();
@@ -829,8 +984,10 @@ mod tests {
             inbound: true,
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
-        handle_incoming(&db, "IR", sms.clone(), &tg).await.unwrap();
-        handle_incoming(&db, "IR", sms, &tg).await.unwrap();
+        handle_incoming(&db, "IR", sms.clone(), &tg, &bus())
+            .await
+            .unwrap();
+        handle_incoming(&db, "IR", sms, &tg, &bus()).await.unwrap();
         assert_eq!(tg.posts.lock().unwrap().len(), 1);
     }
 
@@ -848,8 +1005,8 @@ mod tests {
         };
         let mut b = a.clone();
         b.path = "/sms/2".into();
-        handle_incoming(&db, "IR", a, &tg).await.unwrap();
-        handle_incoming(&db, "IR", b, &tg).await.unwrap();
+        handle_incoming(&db, "IR", a, &tg, &bus()).await.unwrap();
+        handle_incoming(&db, "IR", b, &tg, &bus()).await.unwrap();
         assert_eq!(tg.posts.lock().unwrap().len(), 1);
     }
 
@@ -868,6 +1025,7 @@ mod tests {
                 timestamp: "2024-12-21T15:12:23+03:30".into(),
             },
             &tg,
+            &bus(),
         )
         .await
         .unwrap();
@@ -903,6 +1061,7 @@ mod tests {
                 timestamp: "2024-12-21T15:12:23+03:30".into(),
             },
             &tg,
+            &bus(),
         )
         .await
         .unwrap();
@@ -943,7 +1102,7 @@ mod tests {
             inbound: true,
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
-        assert!(handle_incoming(&db, "IR", sms, &tg).await.is_err());
+        assert!(handle_incoming(&db, "IR", sms, &tg, &bus()).await.is_err());
         assert!(!db.seen_sms_path("/sms/1").unwrap());
     }
 
@@ -952,9 +1111,16 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let tg = FakeTg::new();
         let modem = FakeModem::default();
-        handle_owner_text(&db, "IR", 1, "hello", None, &modem, &tg, true)
-            .await
-            .unwrap();
+        handle_owner_text(
+            &db,
+            "IR",
+            1,
+            "hello",
+            None,
+            &send_context(&modem, &tg, &bus()),
+        )
+        .await
+        .unwrap();
         assert!(modem.sent.lock().unwrap().is_empty());
     }
 
@@ -974,9 +1140,16 @@ mod tests {
         .unwrap();
         let tg = FakeTg::new();
         let modem = FakeModem::default();
-        handle_owner_text(&db, "IR", 42, "hello", Some(7), &modem, &tg, true)
-            .await
-            .unwrap();
+        handle_owner_text(
+            &db,
+            "IR",
+            42,
+            "hello",
+            Some(7),
+            &send_context(&modem, &tg, &bus()),
+        )
+        .await
+        .unwrap();
         let sent = modem.sent.lock().unwrap();
         assert_eq!(sent.as_slice(), &[("+989121234567".into(), "hello".into())]);
         assert_eq!(
@@ -1079,9 +1252,16 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let tg = FakeTg::new();
         let modem = FakeModem::default();
-        send_and_ack(&db, "+98912", "hi", 42, Some(7), &modem, &tg, true)
-            .await
-            .unwrap();
+        send_and_ack(
+            &db,
+            "+98912",
+            "hi",
+            42,
+            Some(7),
+            &send_context(&modem, &tg, &bus()),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             modem.sent.lock().unwrap().as_slice(),
             &[("+98912".into(), "hi".into())]
@@ -1104,9 +1284,16 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let tg = FakeTg::new();
         let modem = FakeModem::default();
-        send_and_ack(&db, "+98912", "hi", 42, None, &modem, &tg, true)
-            .await
-            .unwrap();
+        send_and_ack(
+            &db,
+            "+98912",
+            "hi",
+            42,
+            None,
+            &send_context(&modem, &tg, &bus()),
+        )
+        .await
+        .unwrap();
         assert!(tg.reactions.lock().unwrap().is_empty());
         assert_eq!(
             tg.posts.lock().unwrap().as_slice(),
@@ -1122,9 +1309,16 @@ mod tests {
             fail: true,
             ..FakeModem::default()
         };
-        let err = send_and_ack(&db, "+98912", "hi", 42, Some(7), &modem, &tg, true)
-            .await
-            .unwrap_err();
+        let err = send_and_ack(
+            &db,
+            "+98912",
+            "hi",
+            42,
+            Some(7),
+            &send_context(&modem, &tg, &bus()),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, ActionError::ModemFailed(_)));
         assert_eq!(
             tg.reactions.lock().unwrap().as_slice(),
@@ -1145,9 +1339,16 @@ mod tests {
             fail: true,
             ..FakeModem::default()
         };
-        let err = send_and_ack(&db, "+98912", "hi", 42, None, &modem, &tg, true)
-            .await
-            .unwrap_err();
+        let err = send_and_ack(
+            &db,
+            "+98912",
+            "hi",
+            42,
+            None,
+            &send_context(&modem, &tg, &bus()),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, ActionError::ModemFailed(_)));
         assert!(tg.reactions.lock().unwrap().is_empty());
         assert!(modem.deleted.lock().unwrap().is_empty());
@@ -1165,9 +1366,16 @@ mod tests {
             ..FakeTg::new()
         };
         let modem = FakeModem::default();
-        let err = send_and_ack(&db, "+98912", "hi", 42, Some(7), &modem, &tg, true)
-            .await
-            .unwrap_err();
+        let err = send_and_ack(
+            &db,
+            "+98912",
+            "hi",
+            42,
+            Some(7),
+            &send_context(&modem, &tg, &bus()),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(
             err,
             ActionError::TelegramFailed { sent: false, .. }
@@ -1190,12 +1398,16 @@ mod tests {
             ..FakeModem::default()
         });
         let cancel = CancellationToken::new();
+        let watch = InboxWatch {
+            db,
+            region: "IR".into(),
+            tg: tg.clone(),
+            delete_enabled: true,
+            bus: bus(),
+        };
         let task = tokio::spawn(watch_inbox(
             modem.clone(),
-            db,
-            "IR".into(),
-            tg.clone(),
-            true,
+            watch,
             cancel.clone(),
             Duration::from_secs(30),
         ));
@@ -1234,9 +1446,16 @@ mod tests {
             fail: true,
             ..FakeModem::default()
         };
-        handle_owner_text(&db, "IR", 42, "hello", Some(7), &modem, &tg, true)
-            .await
-            .unwrap();
+        handle_owner_text(
+            &db,
+            "IR",
+            42,
+            "hello",
+            Some(7),
+            &send_context(&modem, &tg, &bus()),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             tg.reactions.lock().unwrap().as_slice(),
             &[(7, SEND_PENDING.into()), (7, SEND_FAIL.into())]
@@ -1262,9 +1481,16 @@ mod tests {
         .unwrap();
         let tg = FakeTg::new();
         let modem = FakeModem::default();
-        let out = handle_owner_text(&db, "IR", 42, "hello", Some(7), &modem, &tg, true)
-            .await
-            .unwrap();
+        let out = handle_owner_text(
+            &db,
+            "IR",
+            42,
+            "hello",
+            Some(7),
+            &send_context(&modem, &tg, &bus()),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             out,
             OwnerTextOutcome::NeedNumber(vec!["+989188086139".into(), "+989025438263".into()])
@@ -1293,9 +1519,16 @@ mod tests {
         .unwrap();
         let tg = FakeTg::new();
         let modem = FakeModem::default();
-        handle_owner_text(&db, "IR", 42, "hello", None, &modem, &tg, true)
-            .await
-            .unwrap();
+        handle_owner_text(
+            &db,
+            "IR",
+            42,
+            "hello",
+            None,
+            &send_context(&modem, &tg, &bus()),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             modem.deleted.lock().unwrap().as_slice(),
             &["/fake/sms/1".into()] as &[String]
@@ -1321,9 +1554,16 @@ mod tests {
             fail: true,
             ..FakeModem::default()
         };
-        handle_owner_text(&db, "IR", 42, "hello", None, &modem, &tg, true)
-            .await
-            .unwrap();
+        handle_owner_text(
+            &db,
+            "IR",
+            42,
+            "hello",
+            None,
+            &send_context(&modem, &tg, &bus()),
+        )
+        .await
+        .unwrap();
         assert!(modem.deleted.lock().unwrap().is_empty());
     }
 
@@ -1343,9 +1583,16 @@ mod tests {
         .unwrap();
         let tg = FakeTg::new();
         let modem = FakeModem::default();
-        handle_owner_text(&db, "IR", 42, "hello", None, &modem, &tg, false)
-            .await
-            .unwrap();
+        handle_owner_text(
+            &db,
+            "IR",
+            42,
+            "hello",
+            None,
+            &send_context_without_delete(&modem, &tg, &bus()),
+        )
+        .await
+        .unwrap();
         assert!(modem.sent.lock().unwrap().len() == 1);
         assert!(modem.deleted.lock().unwrap().is_empty());
     }
@@ -1391,9 +1638,17 @@ mod tests {
             .unwrap();
         let tg = FakeTg::new();
         let modem = FakeModem::default();
-        handle_incoming_then_delete(&db, "IR", sample_inbound("/sms/1"), &tg, &modem, true)
-            .await
-            .unwrap();
+        handle_incoming_then_delete(
+            &db,
+            "IR",
+            sample_inbound("/sms/1"),
+            &tg,
+            &modem,
+            true,
+            &bus(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             modem.deleted.lock().unwrap().as_slice(),
             &["/sms/1".into()] as &[String]
@@ -1409,10 +1664,10 @@ mod tests {
         let tg = FakeTg::new();
         let modem = FakeModem::default();
         let sms = sample_inbound("/sms/1");
-        handle_incoming_then_delete(&db, "IR", sms.clone(), &tg, &modem, true)
+        handle_incoming_then_delete(&db, "IR", sms.clone(), &tg, &modem, true, &bus())
             .await
             .unwrap();
-        handle_incoming_then_delete(&db, "IR", sms, &tg, &modem, true)
+        handle_incoming_then_delete(&db, "IR", sms, &tg, &modem, true, &bus())
             .await
             .unwrap();
         assert_eq!(tg.posts.lock().unwrap().len(), 1);
@@ -1447,7 +1702,7 @@ mod tests {
             inbound: true,
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
-        handle_incoming_then_delete(&db, "IR", sms.clone(), &tg, &modem, true)
+        handle_incoming_then_delete(&db, "IR", sms.clone(), &tg, &modem, true, &bus())
             .await
             .unwrap();
         assert_eq!(tg.posts.lock().unwrap().len(), 1);
@@ -1456,7 +1711,7 @@ mod tests {
             &["/sms/1".into()] as &[String]
         );
         // A later sweep sees the same message again: deduped, no repost.
-        handle_incoming_then_delete(&db, "IR", sms, &tg, &modem, true)
+        handle_incoming_then_delete(&db, "IR", sms, &tg, &modem, true, &bus())
             .await
             .unwrap();
         assert_eq!(tg.posts.lock().unwrap().len(), 1);
@@ -1480,6 +1735,7 @@ mod tests {
             &tg,
             &modem,
             true,
+            &bus(),
         )
         .await
         .unwrap();
@@ -1508,6 +1764,7 @@ mod tests {
             &tg,
             &modem,
             true,
+            &bus(),
         )
         .await
         .unwrap();
@@ -1542,7 +1799,8 @@ mod tests {
             sample_inbound("/sms/1"),
             &tg,
             &modem,
-            true
+            true,
+            &bus(),
         )
         .await
         .is_err());
@@ -1573,7 +1831,7 @@ mod tests {
             inbound: true,
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
-        handle_incoming_then_delete(&db, "IR", sms, &tg, &modem, true)
+        handle_incoming_then_delete(&db, "IR", sms, &tg, &modem, true, &bus())
             .await
             .unwrap();
         assert!(tg.posts.lock().unwrap().is_empty());
@@ -1589,9 +1847,17 @@ mod tests {
             .unwrap();
         let tg = FakeTg::new();
         let modem = FakeModem::default();
-        handle_incoming_then_delete(&db, "IR", sample_inbound("/sms/1"), &tg, &modem, false)
-            .await
-            .unwrap();
+        handle_incoming_then_delete(
+            &db,
+            "IR",
+            sample_inbound("/sms/1"),
+            &tg,
+            &modem,
+            false,
+            &bus(),
+        )
+        .await
+        .unwrap();
         assert!(modem.deleted.lock().unwrap().is_empty());
     }
 

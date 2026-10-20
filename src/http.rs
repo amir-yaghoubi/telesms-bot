@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use axum::body::Body;
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{FromRequest, Path, Query, Request, State};
@@ -15,23 +13,10 @@ use subtle::ConstantTimeEq;
 use tokio_util::sync::CancellationToken;
 
 use crate::actions::{self, ActionError, Identity, NumberState, Opened, SmsSent, Who};
-use crate::app::TelegramSink;
-use crate::config::Config;
-use crate::db::Db;
-use crate::modem::{CallForward, ModemInfo, SmsModem};
+use crate::app::AppState;
 use crate::route::GENERAL_THREAD;
 
-#[derive(Clone)]
-pub struct HttpState {
-    pub cfg: Config,
-    pub db: Arc<Db>,
-    pub modem: Arc<dyn SmsModem>,
-    pub info: Arc<dyn ModemInfo>,
-    pub forward: Arc<dyn CallForward>,
-    pub tg: Arc<dyn TelegramSink>,
-}
-
-pub fn router(state: HttpState) -> Router {
+pub fn router(state: AppState) -> Router {
     let api = Router::new()
         .route("/status", get(status_handler))
         .route("/search", post(search_handler))
@@ -57,7 +42,7 @@ pub fn router(state: HttpState) -> Router {
         .with_state(state)
 }
 
-pub async fn serve(state: HttpState, bind: std::net::SocketAddr, cancel: CancellationToken) {
+pub async fn serve(state: AppState, bind: std::net::SocketAddr, cancel: CancellationToken) {
     let listener = tokio::net::TcpListener::bind(bind).await.expect("api bind");
     axum::serve(listener, router(state))
         .with_graceful_shutdown(async move {
@@ -68,101 +53,23 @@ pub async fn serve(state: HttpState, bind: std::net::SocketAddr, cancel: Cancell
 }
 
 pub fn action_to_response(err: ActionError) -> (StatusCode, Json<Value>) {
-    match err {
-        ActionError::MissingIdentity => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": "missing_identity",
-                "message": "missing identity",
-            })),
-        ),
-        ActionError::Validation(msg) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": "validation",
-                "message": msg,
-            })),
-        ),
-        ActionError::InvalidNumber(msg) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": "invalid_number",
-                "message": msg,
-            })),
-        ),
-        ActionError::NotFound(msg) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({
-                "error": "not_found",
-                "message": msg,
-            })),
-        ),
-        ActionError::IdentityConflict => (
-            StatusCode::CONFLICT,
-            Json(json!({
-                "error": "identity_conflict",
-                "message": "identity fields disagree",
-            })),
-        ),
-        ActionError::NeedDefaultNumber { numbers } => (
-            StatusCode::CONFLICT,
-            Json(json!({
-                "error": "need_default_number",
-                "message": "need default number",
-                "numbers": numbers,
-            })),
-        ),
-        ActionError::ContactsUnavailable => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "error": "contacts_unavailable",
-                "message": "contacts unavailable",
-            })),
-        ),
-        ActionError::ModemFailed(msg) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({
-                "error": "modem_failed",
-                "message": msg,
-            })),
-        ),
-        ActionError::ModemUnavailable(msg) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "error": "modem_unavailable",
-                "message": msg,
-            })),
-        ),
-        ActionError::ForwardFailed(msg) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "error": "forward_failed",
-                "message": msg,
-            })),
-        ),
-        ActionError::TelegramFailed { sent, message } => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({
-                "error": "telegram_failed",
-                "message": message,
-                "sent": sent,
-            })),
-        ),
-        ActionError::Db(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "error": "internal",
-                "message": e.to_string(),
-            })),
-        ),
-        ActionError::App(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "error": "internal",
-                "message": e.to_string(),
-            })),
-        ),
-    }
+    let status = match &err {
+        ActionError::MissingIdentity
+        | ActionError::Validation(_)
+        | ActionError::InvalidNumber(_) => StatusCode::BAD_REQUEST,
+        ActionError::NotFound(_) => StatusCode::NOT_FOUND,
+        ActionError::IdentityConflict | ActionError::NeedDefaultNumber { .. } => {
+            StatusCode::CONFLICT
+        }
+        ActionError::ContactsUnavailable | ActionError::ModemUnavailable(_) => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        ActionError::ModemFailed(_) | ActionError::TelegramFailed { .. } => StatusCode::BAD_GATEWAY,
+        ActionError::ForwardFailed(_) | ActionError::Db(_) | ActionError::App(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    };
+    (status, Json(err.error_body()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,26 +83,10 @@ struct IdentityReq {
 }
 
 fn identity_from_req(req: IdentityReq) -> Result<Identity, ActionError> {
-    let number = req
-        .number
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let has_number = number.is_some();
-    let has_contact = req.contact_id.is_some();
-    let has_thread = req.thread_id.is_some();
-
-    if has_thread && !has_number && !has_contact {
-        return Err(ActionError::MissingIdentity);
-    }
-
-    Ok(Identity {
-        number,
-        contact_id: req.contact_id,
-        thread_id: req.thread_id,
-    })
+    actions::identity_from_parts(req.number, req.contact_id, req.thread_id)
 }
 
-fn api_key_matches(expected: &str, provided: &str) -> bool {
+pub(crate) fn api_key_matches(expected: &str, provided: &str) -> bool {
     let max_len = expected.len().max(provided.len());
     let mut expected_buf = vec![0u8; max_len];
     let mut provided_buf = vec![0u8; max_len];
@@ -207,7 +98,7 @@ fn api_key_matches(expected: &str, provided: &str) -> bool {
     contents_equal && expected.len() == provided.len()
 }
 
-async fn auth_middleware(State(state): State<HttpState>, request: Request, next: Next) -> Response {
+async fn auth_middleware(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let Some(expected) = state.cfg.api_key.as_ref().filter(|k| !k.is_empty()) else {
         return unauthorized();
     };
@@ -310,7 +201,7 @@ async fn not_found() -> impl IntoResponse {
     )
 }
 
-async fn status_handler(State(state): State<HttpState>) -> Response {
+async fn status_handler(State(state): State<AppState>) -> Response {
     match actions::status(
         state.info.as_ref(),
         state.db.as_ref(),
@@ -324,7 +215,7 @@ async fn status_handler(State(state): State<HttpState>) -> Response {
     }
 }
 
-async fn call_forward_get(State(state): State<HttpState>) -> Response {
+async fn call_forward_get(State(state): State<AppState>) -> Response {
     match actions::get_call_forward(state.forward.as_ref(), &state.cfg.default_region).await {
         Ok(st) => Json(json!({
             "enabled": st.enabled,
@@ -336,7 +227,7 @@ async fn call_forward_get(State(state): State<HttpState>) -> Response {
 }
 
 async fn call_forward_put(
-    State(state): State<HttpState>,
+    State(state): State<AppState>,
     ApiJson(body): ApiJson<Value>,
 ) -> Response {
     let Some(value) = body.get("e164") else {
@@ -374,7 +265,7 @@ struct SearchReq {
 }
 
 async fn search_handler(
-    State(state): State<HttpState>,
+    State(state): State<AppState>,
     ApiJson(body): ApiJson<SearchReq>,
 ) -> Response {
     match actions::search_contacts(state.db.as_ref(), &body.query) {
@@ -407,7 +298,7 @@ struct SmsReq {
     text: String,
 }
 
-async fn sms_handler(State(state): State<HttpState>, ApiJson(body): ApiJson<SmsReq>) -> Response {
+async fn sms_handler(State(state): State<AppState>, ApiJson(body): ApiJson<SmsReq>) -> Response {
     let id = match identity_from_req(IdentityReq {
         number: body.number,
         contact_id: body.contact_id,
@@ -417,6 +308,12 @@ async fn sms_handler(State(state): State<HttpState>, ApiJson(body): ApiJson<SmsR
         Err(e) => return action_to_response(e).into_response(),
     };
     let reply_thread = id.thread_id.unwrap_or(GENERAL_THREAD);
+    let ctx = crate::app::SendContext {
+        modem: state.modem.as_ref(),
+        tg: state.tg.as_ref(),
+        bus: &state.bus,
+        delete_enabled: state.cfg.sms_delete_enabled,
+    };
     match actions::send_sms(
         state.db.as_ref(),
         &state.cfg.default_region,
@@ -424,9 +321,7 @@ async fn sms_handler(State(state): State<HttpState>, ApiJson(body): ApiJson<SmsR
         &body.text,
         reply_thread,
         None,
-        state.modem.as_ref(),
-        state.tg.as_ref(),
-        state.cfg.sms_delete_enabled,
+        &ctx,
     )
     .await
     {
@@ -436,7 +331,7 @@ async fn sms_handler(State(state): State<HttpState>, ApiJson(body): ApiJson<SmsR
 }
 
 async fn open_handler(
-    State(state): State<HttpState>,
+    State(state): State<AppState>,
     ApiJson(body): ApiJson<IdentityReq>,
 ) -> Response {
     let id = match identity_from_req(body) {
@@ -457,7 +352,7 @@ async fn open_handler(
 }
 
 async fn who_handler(
-    State(state): State<HttpState>,
+    State(state): State<AppState>,
     ApiJson(body): ApiJson<IdentityReq>,
 ) -> Response {
     let id = match identity_from_req(body) {
@@ -482,7 +377,7 @@ struct NumberReq {
 }
 
 async fn number_handler(
-    State(state): State<HttpState>,
+    State(state): State<AppState>,
     ApiJson(body): ApiJson<NumberReq>,
 ) -> Response {
     let id = match identity_from_req(IdentityReq {
@@ -513,7 +408,7 @@ async fn number_handler(
 }
 
 async fn ignore_handler(
-    State(state): State<HttpState>,
+    State(state): State<AppState>,
     ApiJson(body): ApiJson<IdentityReq>,
 ) -> Response {
     let id = match identity_from_req(body) {
@@ -543,7 +438,7 @@ struct HistoryQuery {
 }
 
 async fn chats_handler(
-    State(state): State<HttpState>,
+    State(state): State<AppState>,
     query: Result<Query<HistoryQuery>, QueryRejection>,
 ) -> Response {
     let Query(q) = match query {
@@ -568,7 +463,7 @@ async fn chats_handler(
 }
 
 async fn chat_messages_handler(
-    State(state): State<HttpState>,
+    State(state): State<AppState>,
     path: Result<Path<i32>, PathRejection>,
     query: Result<Query<HistoryQuery>, QueryRejection>,
 ) -> Response {
@@ -646,11 +541,13 @@ fn number_state_json(st: &NumberState) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::FakeTg;
-    use crate::db::Topic;
-    use crate::modem::FakeModem;
+    use crate::app::{FakeTg, TelegramSink};
+    use crate::config::Config;
+    use crate::db::{Db, Topic};
+    use crate::modem::{CallForward, FakeModem, ModemInfo, SmsModem};
     use http_body_util::BodyExt;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::Duration;
     use tower::ServiceExt;
 
@@ -681,6 +578,9 @@ mod tests {
             api_key: Some(api_key.into()),
             api_bind: "127.0.0.1".into(),
             api_port: 8787,
+            ws_enabled: false,
+            ws_bind: "127.0.0.1".into(),
+            ws_port: 8788,
         }
     }
 
@@ -705,13 +605,14 @@ mod tests {
         let forward = modem.clone() as Arc<dyn CallForward>;
         let modem = modem as Arc<dyn SmsModem>;
         let tg = Arc::new(FakeTg::new()) as Arc<dyn TelegramSink>;
-        router(HttpState {
+        router(AppState {
             cfg: test_config(api_key),
             db,
             modem,
             info,
             forward,
             tg,
+            bus: crate::events::EventBus::new(crate::events::EVENT_BUFFER),
         })
     }
 
@@ -1078,13 +979,14 @@ mod tests {
         let forward = modem.clone() as Arc<dyn CallForward>;
         let modem = modem as Arc<dyn SmsModem>;
         let tg = Arc::new(FakeTg::new()) as Arc<dyn TelegramSink>;
-        router(HttpState {
+        router(AppState {
             cfg: test_config(api_key),
             db,
             modem,
             info,
             forward,
             tg,
+            bus: crate::events::EventBus::new(crate::events::EVENT_BUFFER),
         })
     }
 

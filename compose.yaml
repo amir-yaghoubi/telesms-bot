@@ -7,6 +7,9 @@ services:
     env_file: .env
     ports:
       - "8787:8787"
+      # WebSocket server (opt-in): also set WS_ENABLED=true and WS_BIND=0.0.0.0
+      # in .env — a loopback bind inside the container is unreachable from the host.
+      # - "8788:8788"
     environment:
       TZ: Asia/Tehran
       DBUS_SYSTEM_BUS_ADDRESS: unix:path=/var/run/dbus/system_bus_socket

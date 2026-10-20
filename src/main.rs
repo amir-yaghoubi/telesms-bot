@@ -60,6 +60,7 @@ async fn run_daemon() {
         }
     }
     let db = Arc::new(Db::open(&cfg.database_path).expect("db"));
+    let bus = telesms_bot::events::EventBus::new(telesms_bot::events::EVENT_BUFFER);
     let cancel = CancellationToken::new();
 
     let people: Arc<dyn ContactsSync> = Arc::new(GooglePeople::new(
@@ -96,41 +97,52 @@ async fn run_daemon() {
     );
     let modem: Arc<dyn SmsModem> = mm.clone();
 
-    let db_in = db.clone();
-    let region_in = cfg.default_region.clone();
-    let tg_in = tg.clone();
+    let watch = telesms_bot::app::InboxWatch {
+        db: db.clone(),
+        region: cfg.default_region.clone(),
+        tg: tg.clone(),
+        delete_enabled: cfg.sms_delete_enabled,
+        bus: bus.clone(),
+    };
     let mm_in = mm.clone();
-    let delete_in = cfg.sms_delete_enabled;
     let cancel_in = cancel.clone();
-    tasks.spawn(watch_inbox(
-        mm_in,
-        db_in,
-        region_in,
-        tg_in,
-        delete_in,
-        cancel_in,
-        Duration::from_secs(5),
-    ));
+    tasks.spawn(watch_inbox(mm_in, watch, cancel_in, Duration::from_secs(5)));
 
     let info: Arc<dyn telesms_bot::modem::ModemInfo> = mm.clone();
     let forward: Arc<dyn CallForward> = mm.clone();
+
+    let state = telesms_bot::app::AppState {
+        cfg: cfg.clone(),
+        db: db.clone(),
+        modem: modem.clone(),
+        info: info.clone(),
+        forward: forward.clone(),
+        tg: tg.clone(),
+        bus: bus.clone(),
+    };
 
     if cfg.api_enabled() {
         let bind: std::net::SocketAddr = format!("{}:{}", cfg.api_bind, cfg.api_port)
             .parse()
             .expect("API_BIND/API_PORT");
-        let state = telesms_bot::http::HttpState {
-            cfg: cfg.clone(),
-            db: db.clone(),
-            modem: modem.clone(),
-            info: info.clone(),
-            forward: forward.clone(),
-            tg: tg.clone(),
-        };
+        let state = state.clone();
         let cancel_http = cancel.clone();
         tasks.spawn(async move {
             tracing::info!(%bind, "http api listening");
             telesms_bot::http::serve(state, bind, cancel_http).await;
+        });
+    }
+
+    if cfg.ws_enabled && !cfg.api_enabled() {
+        tracing::warn!("WS_ENABLED is set but API_KEY is missing; websocket server not started");
+    } else if cfg.ws_server_enabled() {
+        let bind: std::net::SocketAddr = format!("{}:{}", cfg.ws_bind, cfg.ws_port)
+            .parse()
+            .expect("WS_BIND/WS_PORT");
+        let state = state.clone();
+        let cancel_ws = cancel.clone();
+        tasks.spawn(async move {
+            telesms_bot::ws::serve(state, bind, cancel_ws).await;
         });
     }
 
@@ -161,11 +173,14 @@ async fn run_daemon() {
         });
     }
 
-    telegram::dispatch(cfg, db, modem, info, forward).await;
+    let send = telesms_bot::app::SendDeps {
+        modem: modem.clone(),
+        bus: bus.clone(),
+    };
+    telegram::dispatch(cfg, db, send, info, forward).await;
     cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
         while tasks.join_next().await.is_some() {}
     })
     .await;
 }
-
