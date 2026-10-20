@@ -114,6 +114,26 @@ pub fn validate_pattern(pattern: &str) -> Result<Regex, PatternError> {
     Ok(re)
 }
 
+/// The pattern for the text before the code, anchored on the nearest token that
+/// is not punctuation. Punctuation-only tokens between it and the code
+/// ("کد : 1234") are kept, separated by optional whitespace.
+fn label_pattern(pre: &str) -> Option<String> {
+    let tokens: Vec<&str> = pre.split_whitespace().collect();
+    let anchor = tokens
+        .iter()
+        .rposition(|token| token.chars().any(char::is_alphanumeric))?;
+    if anchor + 1 == tokens.len() {
+        return Some(format!("{}\\s+", generalize_token(tokens[anchor])));
+    }
+    let mut out = generalize_token(tokens[anchor]);
+    for token in &tokens[anchor + 1..] {
+        out.push_str("\\s*");
+        out.push_str(&generalize_token(token));
+    }
+    out.push_str("\\s*");
+    Some(out)
+}
+
 pub fn derive_pattern(body: &str, code: &str) -> Result<String, PatternError> {
     let body = normalize_digits(body);
     let code = normalize_digits(code);
@@ -138,8 +158,8 @@ pub fn derive_pattern(body: &str, code: &str) -> Result<String, PatternError> {
     let s = start.ok_or_else(|| PatternError::CodeNotFound(code.clone()))?;
     let pre: String = chars[..s].iter().collect();
     let post: String = chars[s + n..].iter().collect();
-    let pattern = match pre.split_whitespace().next_back() {
-        Some(label) => format!("{}\\s+(\\d{{4,8}})", generalize_token(label)),
+    let pattern = match label_pattern(&pre) {
+        Some(label) => format!("{label}(\\d{{4,8}})"),
         None => match post.split_whitespace().next() {
             Some(word) => format!("(\\d{{4,8}})\\s+{}", generalize_token(word)),
             None => return Err(PatternError::NoContext(code)),
@@ -179,6 +199,33 @@ mod tests {
     const SNAPPFOOD_REAL_BODY: &str =
         "بلو\nبفرمایید رمز پویا\nخرید\nاسنپ پي\nمبلغ: 48,322,100 ریال\nرمز: 402332\n01:48";
     const NORANGAR_BODY: &str = "Code: 92239\nکد تائید ورود\nنورنگار\nلغو11";
+
+    #[test]
+    fn punctuation_before_the_code_walks_back_to_the_label() {
+        for (body, code, matching, other) in [
+            ("کد : 1234", "1234", ["کد : 5555", "کد: 5555"], "کد 5555"),
+            (
+                "Code : 1234",
+                "1234",
+                ["Code : 5555", "Code: 5555"],
+                "Code 5555",
+            ),
+        ] {
+            let p = derive_pattern(body, code).unwrap();
+            let re = validate_pattern(&p).unwrap();
+            for text in matching {
+                assert_eq!(&re.captures(text).unwrap()[1], "5555", "{p} on {text}");
+            }
+            assert_eq!(&re.captures(other).map(|c| c[1].to_string()), &None);
+        }
+    }
+
+    #[test]
+    fn no_letter_before_the_code_falls_back_to_the_following_word() {
+        let p = derive_pattern(": 1234 is your login", "1234").unwrap();
+        let re = validate_pattern(&p).unwrap();
+        assert_eq!(&re.captures("9999 is your login").unwrap()[1], "9999");
+    }
 
     #[test]
     fn derives_label_anchor_from_plain_sample() {
