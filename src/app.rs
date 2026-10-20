@@ -390,8 +390,13 @@ pub trait TelegramSink: Send + Sync {
     async fn edit_html(&self, _message_id: i32, _html: String) -> Result<(), AppError> {
         Err(AppError::Telegram("edit_html not supported".into()))
     }
-    /// Sends a selective force-reply prompt in the thread.
-    async fn prompt_reply(&self, _thread_id: i32, _text: String) -> Result<(), AppError> {
+    /// Sends a force-reply prompt in the thread, replying to `reply_to` when given.
+    async fn prompt_reply(
+        &self,
+        _thread_id: i32,
+        _text: String,
+        _reply_to: Option<i32>,
+    ) -> Result<(), AppError> {
         Err(AppError::Telegram("prompt_reply not supported".into()))
     }
 }
@@ -402,7 +407,7 @@ pub struct FakeTg {
     pub reactions: Mutex<Vec<(i32, String)>>,
     pub rich_posts: Mutex<Vec<(i32, RichPost)>>,
     pub edits: Mutex<Vec<(i32, String)>>,
-    pub prompts: Mutex<Vec<(i32, String)>>,
+    pub prompts: Mutex<Vec<(i32, String, Option<i32>)>>,
     pub next_thread: AtomicI32,
     pub next_message: AtomicI32,
     pub fail: AtomicBool,
@@ -494,14 +499,19 @@ impl TelegramSink for FakeTg {
         Ok(())
     }
 
-    async fn prompt_reply(&self, thread_id: i32, text: String) -> Result<(), AppError> {
+    async fn prompt_reply(
+        &self,
+        thread_id: i32,
+        text: String,
+        reply_to: Option<i32>,
+    ) -> Result<(), AppError> {
         if self.fail.load(Ordering::SeqCst) {
             return Err(AppError::Telegram("fail".into()));
         }
         self.prompts
             .lock()
             .expect("fake tg prompts lock")
-            .push((thread_id, text));
+            .push((thread_id, text, reply_to));
         Ok(())
     }
 }
@@ -1518,14 +1528,14 @@ mod tests {
             &[(7, first), (8, second)]
         );
         tg.edit_html(500, "<i>x</i>".into()).await.unwrap();
-        tg.prompt_reply(7, "name?".into()).await.unwrap();
+        tg.prompt_reply(7, "name?".into(), Some(9)).await.unwrap();
         assert_eq!(
             tg.edits.lock().unwrap().as_slice(),
             &[(500, "<i>x</i>".into())]
         );
         assert_eq!(
             tg.prompts.lock().unwrap().as_slice(),
-            &[(7, "name?".into())]
+            &[(7, "name?".into(), Some(9))]
         );
     }
 

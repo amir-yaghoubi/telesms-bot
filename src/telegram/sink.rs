@@ -95,11 +95,19 @@ impl TelegramSink for RealTg {
             })
     }
 
-    async fn prompt_reply(&self, thread_id: i32, text: String) -> Result<(), AppError> {
+    async fn prompt_reply(
+        &self,
+        thread_id: i32,
+        text: String,
+        reply_to: Option<i32>,
+    ) -> Result<(), AppError> {
         let mut req = self
             .bot
             .send_message(self.chat_id, text)
-            .reply_markup(ForceReply::new().selective());
+            .reply_markup(ForceReply::new());
+        if let Some(reply_to) = reply_to {
+            req = req.reply_parameters(ReplyParameters::new(MessageId(reply_to)));
+        }
         if let Some(thread) = forum_thread(thread_id) {
             req = req.message_thread_id(thread);
         }

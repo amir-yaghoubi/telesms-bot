@@ -80,7 +80,10 @@ pub(crate) async fn handle_otp_command(
     teach(db, tg, bus, cfg, thread_id, id, &code).await
 }
 
-/// The "Teach code" button: asks for the code with a force-reply prompt.
+const TEACH_DIGITS_ONLY: &str = "Send digits only";
+
+/// The "Teach code" button: asks for the code with a force-reply prompt that
+/// replies to the SMS post.
 pub(crate) async fn handle_teach_callback(
     db: &Db,
     tg: &dyn TelegramSink,
@@ -91,12 +94,16 @@ pub(crate) async fn handle_teach_callback(
         .inbound_by_tg_msg(tg_msg)?
         .and_then(|row| inbound_numeric_id(&row.id));
     match id {
-        Some(id) => tg.prompt_reply(thread_id, teach_prompt(id)).await,
+        Some(id) => {
+            tg.prompt_reply(thread_id, teach_prompt(id), Some(tg_msg))
+                .await
+        }
         None => tg.post(thread_id, NOT_FOUND.to_string()).await,
     }
 }
 
-/// A digits-only reply to a teach prompt. Returns whether the reply was consumed.
+/// Any reply to a teach prompt. Returns whether the reply was consumed, so it is
+/// never sent to the contact as an SMS.
 pub(crate) async fn handle_teach_reply(
     db: &Db,
     tg: &dyn TelegramSink,
@@ -106,10 +113,13 @@ pub(crate) async fn handle_teach_reply(
     replied_text: &str,
     text: &str,
 ) -> Result<bool, AppError> {
-    let (Some(id), Some(code)) = (parse_teach_prompt(replied_text), parse_code(text)) else {
+    let Some(id) = parse_teach_prompt(replied_text) else {
         return Ok(false);
     };
-    teach(db, tg, bus, cfg, thread_id, id, &code).await?;
+    match parse_code(text) {
+        Some(code) => teach(db, tg, bus, cfg, thread_id, id, &code).await?,
+        None => tg.post(thread_id, TEACH_DIGITS_ONLY.to_string()).await?,
+    }
     Ok(true)
 }
 

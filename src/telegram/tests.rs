@@ -1083,7 +1083,7 @@ async fn teach_callback_prompts_for_the_code() {
     handle_teach_callback(&db, &tg, 1, 77).await.unwrap();
     assert_eq!(
         tg.prompts.lock().unwrap().as_slice(),
-        &[(1, format!("Reply with the code for message {id}"))]
+        &[(1, format!("Reply with the code for message {id}"), Some(77))]
     );
 }
 
@@ -1123,17 +1123,40 @@ async fn digits_reply_to_teach_prompt_learns() {
 }
 
 #[tokio::test]
-async fn non_digit_reply_or_other_parent_is_not_consumed() {
+async fn non_digit_reply_to_teach_prompt_is_consumed_with_a_hint() {
     let db = Db::open_in_memory().unwrap();
     let id = teachable(&db);
     let tg = FakeTg::new();
     let prompt = format!("Reply with the code for message {id}");
-    for (parent, text) in [(prompt.as_str(), "hello"), ("some other message", "5388")] {
-        let consumed = handle_teach_reply(&db, &tg, &bus(), &sorting_cfg(), 1, parent, text)
+    for text in ["code 5388", "5388.", "5 388", "hello"] {
+        let consumed = handle_teach_reply(&db, &tg, &bus(), &sorting_cfg(), 1, &prompt, text)
             .await
             .unwrap();
-        assert!(!consumed);
+        assert!(consumed, "{text}");
     }
+    let posts = tg.posts.lock().unwrap();
+    assert_eq!(posts.len(), 4);
+    assert!(posts.iter().all(|p| p.1 == "Send digits only"));
+    assert!(tg.edits.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reply_to_another_message_is_not_a_teach_reply() {
+    let db = Db::open_in_memory().unwrap();
+    teachable(&db);
+    let tg = FakeTg::new();
+    let consumed = handle_teach_reply(
+        &db,
+        &tg,
+        &bus(),
+        &sorting_cfg(),
+        1,
+        "some other message",
+        "5388",
+    )
+    .await
+    .unwrap();
+    assert!(!consumed);
     assert!(tg.posts.lock().unwrap().is_empty());
     assert!(tg.edits.lock().unwrap().is_empty());
 }
