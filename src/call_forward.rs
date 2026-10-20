@@ -92,9 +92,7 @@ pub fn parse_ccfc_reply(text: &str, default_region: &str) -> Result<CallForwardS
         });
     }
     if enabled_without_number {
-        return Err(format!(
-            "AT+CCFC reports active but has no number: {text}"
-        ));
+        return Err(format!("AT+CCFC reports active but has no number: {text}"));
     }
     if saw_ccfc || upper.contains("OK") {
         return Ok(CallForwardState {

@@ -13,7 +13,9 @@ use crate::google::{ContactsSync, GoogleError};
 use crate::modem::{IncomingSms, ModemError, ModemInfo, SmsInbox, SmsModem};
 use crate::modem_mm::MmModem;
 use crate::normalize::normalize_e164;
-use crate::route::{plan_outbound, route_for_send, route_inbound, InboundDest, OutboundPlan, GENERAL_THREAD};
+use crate::route::{
+    plan_outbound, route_for_send, route_inbound, InboundDest, OutboundPlan, GENERAL_THREAD,
+};
 
 #[derive(Debug, Error)]
 pub enum AppError {
@@ -174,9 +176,7 @@ async fn sync_once(
     if let Some(available) = available {
         if let Some(event) = presence.peek(available) {
             let text = match event {
-                PresenceEvent::Offline => {
-                    "⚠️ Google contacts token dead — run cargo run -- auth"
-                }
+                PresenceEvent::Offline => "⚠️ Google contacts token dead — run cargo run -- auth",
                 PresenceEvent::Back => "google contacts back",
             };
             match tg.post(GENERAL_THREAD, text.to_string()).await {
