@@ -30,3 +30,6 @@ tower-http = { version = "0.6", features = ["trace"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 subtle = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
