@@ -2286,7 +2286,9 @@ mod tests {
             "🟨 <b>تبلیغاتی</b>\n+989981600237\noff 50%"
         );
         assert!(tg.posts.lock().unwrap().is_empty());
-        assert_eq!(events.try_recv().expect("announced").thread_id, tid);
+        let announced = events.try_recv().expect("announced");
+        assert_eq!(announced.thread_id, tid);
+        assert_eq!(announced.classification.unwrap().category, "promotional");
         let rows = recorded(&db);
         assert_eq!(rows[0].thread_id, tid);
         assert_eq!(
@@ -2325,6 +2327,8 @@ mod tests {
         db.add_otp_pattern(Some("bank"), r"رمز:\s+(\d{4,8})")
             .unwrap();
         let tg = FakeTg::new();
+        let bus = bus();
+        let mut events = bus.subscribe();
         let sorting = sorting_with(vec![Ok(stored("transactional", 0.9, &[]))]);
 
         handle_incoming(
@@ -2332,7 +2336,7 @@ mod tests {
             "IR",
             unknown_sms("/sms/1", "رمز: 402332"),
             &tg,
-            &bus(),
+            &bus,
             &sorting,
         )
         .await
@@ -2345,6 +2349,10 @@ mod tests {
         assert!(posts[0].1.html.contains("<code>402332</code>"));
         assert!(posts[0].1.buttons.is_empty());
         assert_eq!(recorded(&db)[0].otp_code.as_deref(), Some("402332"));
+        assert_eq!(
+            events.try_recv().expect("announced").otp_code.as_deref(),
+            Some("402332")
+        );
     }
 
     #[tokio::test]

@@ -37,6 +37,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::actions::{self, Identity};
 use crate::app::AppState;
+use crate::db::Classification;
 use crate::events::MessageEvent;
 use crate::route::GENERAL_THREAD;
 
@@ -137,6 +138,8 @@ pub struct MessagePayload {
     pub sms_ts: Option<String>,
     pub status: String,
     pub thread_id: i32,
+    pub classification: Option<Classification>,
+    pub otp_code: Option<String>,
 }
 
 impl From<&MessageEvent> for MessagePayload {
@@ -150,12 +153,17 @@ impl From<&MessageEvent> for MessagePayload {
             sms_ts: message.sms_ts.clone(),
             status: message.status.clone(),
             thread_id: message.thread_id,
+            classification: message.classification.clone(),
+            otp_code: message.otp_code.clone(),
         }
     }
 }
 
 /// The event name a recorded message is announced under.
 pub fn event_type(message: &MessageEvent) -> &'static str {
+    if message.updated {
+        return "message.updated";
+    }
     match message.direction.as_str() {
         "out" => match message.status.as_str() {
             "ok" => "message.sent",
@@ -541,7 +549,7 @@ async fn send_sms(state: &AppState, id: Option<&str>, data: Value) -> Value {
 mod tests {
     use super::*;
     use crate::app::FakeTg;
-    use crate::db::Topic;
+    use crate::db::{MessageRow, StoredClassification, Topic};
     use crate::events::EventBus;
     use crate::modem::FakeModem;
     use std::path::PathBuf;
@@ -615,6 +623,9 @@ mod tests {
             sms_ts: None,
             status: status.into(),
             thread_id: 9,
+            classification: None,
+            otp_code: None,
+            updated: false,
         }
     }
 
@@ -623,6 +634,53 @@ mod tests {
         assert_eq!(event_type(&recorded("in", "ok")), "message.received");
         assert_eq!(event_type(&recorded("out", "ok")), "message.sent");
         assert_eq!(event_type(&recorded("out", "failed")), "message.failed");
+    }
+
+    #[test]
+    fn updated_event_type() {
+        let row = MessageRow {
+            id: "in:1".into(),
+            direction: "in".into(),
+            e164: "+989121234567".into(),
+            body: "hello".into(),
+            timestamp: "2026-10-20T10:00:00+00:00".into(),
+            sms_ts: None,
+            status: "ok".into(),
+            thread_id: 9,
+            classification: None,
+            otp_code: None,
+        };
+        assert_eq!(
+            event_frame(&MessageEvent::updated(row))["type"],
+            "message.updated"
+        );
+    }
+
+    #[test]
+    fn payload_includes_classification_and_otp_code() {
+        let mut message = recorded("in", "ok");
+        message.classification = Some(Classification {
+            category: "promotional".into(),
+            confidence: 0.61,
+            tags: vec!["scam".into()],
+        });
+        message.otp_code = Some("402332".into());
+        let frame = event_frame(&message);
+        assert_eq!(
+            frame["data"]["classification"],
+            json!({"category": "promotional", "confidence": 0.61, "tags": ["scam"]})
+        );
+        assert_eq!(frame["data"]["otp_code"], "402332");
+    }
+
+    #[test]
+    fn payload_nulls_when_absent() {
+        let frame = event_frame(&recorded("in", "ok"));
+        let data = frame["data"].as_object().expect("payload object");
+        assert!(data.contains_key("classification"));
+        assert!(data.contains_key("otp_code"));
+        assert_eq!(data["classification"], Value::Null);
+        assert_eq!(data["otp_code"], Value::Null);
     }
 
     #[test]
@@ -877,6 +935,51 @@ mod tests {
         let value = next_text(&mut client).await;
         assert_eq!(value["type"], "message.received");
         assert_eq!(value["data"]["body"], "older");
+
+        cancel.cancel();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn replayed_messages_carry_classification_and_otp_code() {
+        let (state, _modem, _bus) = test_state("secret");
+        let db = state.db.clone();
+        let (addr, cancel, server) = start_server(state).await;
+
+        let classified = StoredClassification {
+            public: Classification {
+                category: "transactional".into(),
+                confidence: 0.9,
+                tags: vec![],
+            },
+            scores: json!({}),
+        };
+        db.record_inbound(
+            "/sms/1",
+            "+989121234567",
+            "رمز: 402332",
+            None,
+            "2026-10-20T10:00:00+00:00",
+            9,
+            Some("402332"),
+            Some(&classified),
+        )
+        .unwrap();
+
+        let stream = TcpStream::connect(addr).await.expect("connect");
+        let mut request = format!("ws://{addr}/?after=2026-10-20T09:00:00%2B00:00")
+            .into_client_request()
+            .expect("request");
+        request
+            .headers_mut()
+            .insert("X-Api-Key", "secret".parse().expect("header value"));
+        let (mut client, _) = tokio_tungstenite::client_async(request, stream)
+            .await
+            .expect("connect");
+
+        let value = next_text(&mut client).await;
+        assert_eq!(value["data"]["otp_code"], "402332");
+        assert_eq!(value["data"]["classification"]["category"], "transactional");
 
         cancel.cancel();
         server.abort();
