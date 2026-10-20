@@ -986,7 +986,6 @@ components:
         pattern:
           type: string
       required: [pattern]
-      additionalProperties: false
 
     LearnRequest:
       type: object
@@ -1004,7 +1003,6 @@ components:
           type: string
           nullable: true
       required: [code]
-      additionalProperties: false
 
     LearnResult:
       type: object
