@@ -16,17 +16,21 @@ use crate::app::{
 use crate::call_forward::CallForwardState;
 use crate::config::Config;
 use crate::db::{Contact, Db, PendingForward, PendingForwardMode, Topic};
+use crate::events::EventBus;
 use crate::modem::CallForward;
 use crate::route::GENERAL_THREAD;
+use crate::sorting::config::SortingConfig;
+use crate::sorting::learn::{inbound_numeric_id, learn_otp, LearnError, LearnSource};
 
 use super::keyboards::{
     forward_keyboard, forward_number_keyboard, forward_search_keyboard, inline_answer_articles,
     inline_query_results, number_keyboard, search_keyboard, status_keyboard,
 };
 use super::parse::{
-    allow_dm_callback, allowed, bot_commands, format_who, help_text, is_owner_dm,
-    parse_cf_callback, parse_cmd_name, parse_ignore_reply, parse_num_callback, parse_open_callback,
-    parse_open_cmd, parse_search_query, parse_sms_cmd, parse_status_refresh, topic_open_message,
+    allow_dm_callback, allowed, bot_commands, format_who, help_text, is_otp_teach_callback,
+    is_owner_dm, parse_cf_callback, parse_cmd_name, parse_code, parse_ignore_reply,
+    parse_num_callback, parse_open_callback, parse_open_cmd, parse_otp_cmd, parse_search_query,
+    parse_sms_cmd, parse_status_refresh, parse_teach_prompt, teach_prompt, topic_open_message,
     CfAction,
 };
 use super::sink::RealTg;
@@ -46,6 +50,104 @@ async fn register_commands(bot: &Bot, group_id: i64) {
     if let Err(err) = result {
         tracing::warn!(error = %err, "setMyCommands failed");
     }
+}
+
+const OTP_USAGE: &str = "Reply to an SMS with /otp <code> to teach its code";
+const NOT_FOUND: &str = "Message not found";
+
+/// `/otp <code>` as a reply to an inbound SMS post.
+pub(crate) async fn handle_otp_command(
+    db: &Db,
+    tg: &dyn TelegramSink,
+    bus: &EventBus,
+    cfg: &SortingConfig,
+    thread_id: i32,
+    replied_tg_msg: Option<i32>,
+    text: &str,
+) -> Result<(), AppError> {
+    let (Some(replied), Some(code)) = (replied_tg_msg, parse_otp_cmd(text)) else {
+        tg.post(thread_id, OTP_USAGE.to_string()).await?;
+        return Ok(());
+    };
+    let Some(row) = db.inbound_by_tg_msg(replied)? else {
+        tg.post(thread_id, NOT_FOUND.to_string()).await?;
+        return Ok(());
+    };
+    let Some(id) = inbound_numeric_id(&row.id) else {
+        tg.post(thread_id, NOT_FOUND.to_string()).await?;
+        return Ok(());
+    };
+    teach(db, tg, bus, cfg, thread_id, id, &code).await
+}
+
+const TEACH_DIGITS_ONLY: &str = "Send digits only";
+
+/// The "Teach code" button: asks for the code with a force-reply prompt that
+/// replies to the SMS post.
+pub(crate) async fn handle_teach_callback(
+    db: &Db,
+    tg: &dyn TelegramSink,
+    thread_id: i32,
+    tg_msg: i32,
+) -> Result<(), AppError> {
+    let id = db
+        .inbound_by_tg_msg(tg_msg)?
+        .and_then(|row| inbound_numeric_id(&row.id));
+    match id {
+        Some(id) => {
+            tg.prompt_reply(thread_id, teach_prompt(id), Some(tg_msg))
+                .await
+        }
+        None => tg.post(thread_id, NOT_FOUND.to_string()).await,
+    }
+}
+
+/// Any reply to a teach prompt. Returns whether the reply was consumed, so it is
+/// never sent to the contact as an SMS.
+pub(crate) async fn handle_teach_reply(
+    db: &Db,
+    tg: &dyn TelegramSink,
+    bus: &EventBus,
+    cfg: &SortingConfig,
+    thread_id: i32,
+    replied_text: &str,
+    text: &str,
+) -> Result<bool, AppError> {
+    let Some(id) = parse_teach_prompt(replied_text) else {
+        return Ok(false);
+    };
+    match parse_code(text) {
+        Some(code) => teach(db, tg, bus, cfg, thread_id, id, &code).await?,
+        None => tg.post(thread_id, TEACH_DIGITS_ONLY.to_string()).await?,
+    }
+    Ok(true)
+}
+
+async fn teach(
+    db: &Db,
+    tg: &dyn TelegramSink,
+    bus: &EventBus,
+    cfg: &SortingConfig,
+    thread_id: i32,
+    inbound_id: i64,
+    code: &str,
+) -> Result<(), AppError> {
+    let reply = match learn_otp(
+        db,
+        tg,
+        bus,
+        cfg,
+        LearnSource::Message(inbound_id),
+        code,
+        None,
+    )
+    .await
+    {
+        Ok(learned) => format!("Learned pattern {}", learned.pattern.name),
+        Err(LearnError::Db(err)) => return Err(err.into()),
+        Err(err) => err.to_string(),
+    };
+    tg.post(thread_id, reply).await
 }
 
 pub(crate) async fn handle_who(
@@ -79,6 +181,7 @@ pub(crate) async fn handle_who(
                 default_e164: w.default_e164.clone(),
                 title: w.display_name.clone(),
                 ignored: false,
+                sort: None,
             };
             let mut text = format_who(&topic, Some(&w.display_name), &w.numbers);
             if w.ambiguous {
@@ -241,12 +344,15 @@ pub(crate) async fn handle_ignore(
     reply_text: Option<&str>,
     tg: &dyn TelegramSink,
 ) -> Result<(), AppError> {
-    let identity = if thread_id == GENERAL_THREAD {
+    let topic = db.get_topic_by_thread(thread_id)?;
+    let like_general =
+        thread_id == GENERAL_THREAD || topic.as_ref().is_some_and(|t| t.sort.is_some());
+    let identity = if like_general {
         Identity {
             number: reply_text.and_then(parse_ignore_reply).map(str::to_string),
             ..Default::default()
         }
-    } else if let Some(topic) = db.get_topic_by_thread(thread_id)? {
+    } else if let Some(topic) = topic {
         Identity {
             contact_id: topic.contact_id,
             thread_id: Some(thread_id),
@@ -614,12 +720,14 @@ The bot must be a group admin with Manage Topics.",
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn on_message(
     bot: Bot,
     msg: Message,
     cfg: Config,
     db: Arc<Db>,
     send: SendDeps,
+    sorting: Arc<SortingConfig>,
     info: Arc<dyn crate::modem::ModemInfo>,
     forward: Arc<dyn CallForward>,
 ) -> Result<(), AppError> {
@@ -661,6 +769,11 @@ async fn on_message(
         }
         return Ok(());
     }
+    if let Some(replied_text) = msg.reply_to_message().and_then(|m| m.text()) {
+        if handle_teach_reply(&db, &tg, &send.bus, &sorting, thread_id, replied_text, text).await? {
+            return Ok(());
+        }
+    }
     if let Some((raw, body)) = parse_sms_cmd(text) {
         let ctx = SendContext {
             modem: send.modem.as_ref(),
@@ -693,6 +806,10 @@ async fn on_message(
         Some("ignore") => {
             let reply = msg.reply_to_message().and_then(|m| m.text());
             handle_ignore(&db, &cfg.default_region, thread_id, reply, &tg).await?;
+        }
+        Some("otp") => {
+            let replied = msg.reply_to_message().map(|m| m.id.0);
+            handle_otp_command(&db, &tg, &send.bus, &sorting, thread_id, replied, text).await?;
         }
         Some("forward") => {
             send_forward_card(
@@ -942,6 +1059,11 @@ async fn on_callback(
         handle_num_callback(&db, &cfg.default_region, thread_id, e164, &ctx).await
     } else if let Some(contact_id) = parse_open_callback(data) {
         handle_open(&db, cfg.telegram_group_id, thread_id, contact_id, &tg).await
+    } else if is_otp_teach_callback(data) {
+        let Some(message) = q.regular_message() else {
+            return Ok(());
+        };
+        handle_teach_callback(&db, &tg, thread_id, message.id.0).await
     } else {
         Ok(())
     }
@@ -975,11 +1097,12 @@ pub async fn dispatch(
     send: SendDeps,
     info: Arc<dyn crate::modem::ModemInfo>,
     forward: Arc<dyn CallForward>,
+    sorting: Arc<SortingConfig>,
 ) {
     let bot = Bot::new(cfg.telegram_bot_token.clone());
     register_commands(&bot, cfg.telegram_group_id).await;
     Dispatcher::builder(bot, schema())
-        .dependencies(dptree::deps![cfg, db, send, info, forward])
+        .dependencies(dptree::deps![cfg, db, send, sorting, info, forward])
         .error_handler(LoggingErrorHandler::with_custom_text(
             "telegram handler error",
         ))

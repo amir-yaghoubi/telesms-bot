@@ -726,9 +726,8 @@ impl CallForward for MmModem {
             Ok(()) => {}
             Err(at_err) => {
                 tracing::warn!(error = %at_err, "AT+CCFC enable failed; trying USSD");
-                apply_ussd_reply(self.ussd_initiate(&ussd_enable(&e164)).await).map_err(
-                    |ussd_err| combine_cf_transport_errs("set", &at_err, &ussd_err),
-                )?;
+                apply_ussd_reply(self.ussd_initiate(&ussd_enable(&e164)).await)
+                    .map_err(|ussd_err| combine_cf_transport_errs("set", &at_err, &ussd_err))?;
             }
         }
 
@@ -754,9 +753,8 @@ impl CallForward for MmModem {
             Ok(()) => {}
             Err(at_err) => {
                 tracing::warn!(error = %at_err, "AT+CCFC disable failed; trying USSD");
-                apply_ussd_reply(self.ussd_initiate(ussd_disable()).await).map_err(|ussd_err| {
-                    combine_cf_transport_errs("disable", &at_err, &ussd_err)
-                })?;
+                apply_ussd_reply(self.ussd_initiate(ussd_disable()).await)
+                    .map_err(|ussd_err| combine_cf_transport_errs("disable", &at_err, &ussd_err))?;
             }
         }
 

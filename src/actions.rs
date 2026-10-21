@@ -1,7 +1,8 @@
 use crate::app::TelegramSink;
-use crate::db::{Contact, Db, Topic};
+use crate::db::{Classification, Contact, Db, MessageFilter, MessageRow, OtpPatternRow, Topic};
 use crate::normalize::normalize_e164;
 use crate::route::GENERAL_THREAD;
+use crate::sorting::learn::{inbound_numeric_id, LearnError, LearnSource};
 
 #[derive(Debug, Clone, Default)]
 pub struct Identity {
@@ -55,6 +56,16 @@ pub enum ActionError {
     Db(#[from] crate::db::DbError),
     #[error(transparent)]
     App(#[from] crate::app::AppError),
+}
+
+impl From<LearnError> for ActionError {
+    fn from(err: LearnError) -> Self {
+        match err {
+            LearnError::NotFound => ActionError::NotFound("unknown message".into()),
+            LearnError::Pattern(err) => ActionError::Validation(err.to_string()),
+            LearnError::Db(err) => ActionError::Db(err),
+        }
+    }
 }
 
 impl ActionError {
@@ -266,6 +277,10 @@ pub struct ChatListItem {
     pub last_message_preview: String,
     pub last_message_direction: String,
     pub unread_count: Option<i64>,
+    /// `general`, `sorted`, `contact` or `number`.
+    pub kind: &'static str,
+    /// The sort key of a Sorted Thread.
+    pub sort: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -286,6 +301,68 @@ pub struct MessageItem {
     pub timestamp: String,
     pub sms_ts: Option<String>,
     pub status: String,
+    pub classification: Option<Classification>,
+    pub otp_code: Option<String>,
+}
+
+impl From<MessageRow> for MessageItem {
+    fn from(message: MessageRow) -> Self {
+        Self {
+            id: message.id,
+            direction: message.direction,
+            e164: message.e164,
+            body: message.body,
+            timestamp: message.timestamp,
+            sms_ts: message.sms_ts,
+            status: message.status,
+            classification: message.classification,
+            otp_code: message.otp_code,
+        }
+    }
+}
+
+/// Categories the `category` history filter accepts.
+const FILTER_CATEGORIES: [&str; 6] = [
+    "transactional",
+    "promotional",
+    "broadcast",
+    "feedback",
+    "personal",
+    "other",
+];
+
+/// Tags the `tag` history filter accepts.
+const FILTER_TAGS: [&str; 1] = ["scam"];
+
+/// A message filter from the raw query values; unknown values are rejected.
+pub fn message_filter(
+    category: Option<&str>,
+    tag: Option<&str>,
+) -> Result<MessageFilter, ActionError> {
+    if let Some(category) = category.filter(|c| !FILTER_CATEGORIES.contains(c)) {
+        return Err(ActionError::Validation(format!(
+            "unknown category '{category}'"
+        )));
+    }
+    if let Some(tag) = tag.filter(|t| !FILTER_TAGS.contains(t)) {
+        return Err(ActionError::Validation(format!("unknown tag '{tag}'")));
+    }
+    Ok(MessageFilter {
+        category: category.map(str::to_string),
+        tag: tag.map(str::to_string),
+    })
+}
+
+fn chat_kind(thread_id: i32, sort: Option<&str>, contact_id: Option<i64>) -> &'static str {
+    if thread_id == GENERAL_THREAD {
+        "general"
+    } else if sort.is_some() {
+        "sorted"
+    } else if contact_id.is_some() {
+        "contact"
+    } else {
+        "number"
+    }
 }
 
 fn history_limit(limit: Option<i64>) -> Result<i64, ActionError> {
@@ -337,6 +414,8 @@ pub fn list_chats(
         .chats_with_activity(limit, before.as_deref(), after.as_deref())?
         .into_iter()
         .map(|chat| ChatListItem {
+            kind: chat_kind(chat.thread_id, chat.sort.as_deref(), chat.contact_id),
+            sort: chat.sort,
             thread_id: chat.thread_id,
             title: chat.title,
             contact_id: chat.contact_id,
@@ -401,6 +480,7 @@ pub fn list_messages(
     after: Option<&str>,
     number: Option<&str>,
     contact_id: Option<i64>,
+    filter: &MessageFilter,
 ) -> Result<MessageList, ActionError> {
     let limit = history_limit(limit)?;
     let (before, after) = history_cursors(before, after)?;
@@ -415,17 +495,15 @@ pub fn list_messages(
     check_message_identity(db, region, thread_id, topic.as_ref(), number, contact_id)?;
 
     let messages = db
-        .messages_for_thread(thread_id, limit, before.as_deref(), after.as_deref())?
+        .messages_for_thread(
+            thread_id,
+            limit,
+            before.as_deref(),
+            after.as_deref(),
+            filter,
+        )?
         .into_iter()
-        .map(|message| MessageItem {
-            id: message.id,
-            direction: message.direction,
-            e164: message.e164,
-            body: message.body,
-            timestamp: message.timestamp,
-            sms_ts: message.sms_ts,
-            status: message.status,
-        })
+        .map(MessageItem::from)
         .collect::<Vec<_>>();
     let next_before = (messages.len() == limit as usize)
         .then(|| messages.last().map(|message| message.timestamp.clone()))
@@ -441,6 +519,42 @@ pub fn list_messages(
         messages,
         next_before,
     })
+}
+
+/// Validates and stores an OTP Pattern; the bool is true when it was new.
+pub fn add_otp_pattern(
+    db: &Db,
+    name: Option<&str>,
+    pattern: &str,
+) -> Result<(OtpPatternRow, bool), ActionError> {
+    crate::otp::validate_pattern(pattern).map_err(|e| ActionError::Validation(e.to_string()))?;
+    let name = name.map(str::trim).filter(|n| !n.is_empty());
+    Ok(db.add_otp_pattern(name, pattern)?)
+}
+
+pub fn delete_otp_pattern(db: &Db, id: i64) -> Result<(), ActionError> {
+    if db.delete_otp_pattern(id)? {
+        Ok(())
+    } else {
+        Err(ActionError::NotFound("unknown pattern".into()))
+    }
+}
+
+/// The sample source of a learn request: exactly one of an inbound message id
+/// (`in:<n>`) and a body.
+pub fn learn_source(
+    message_id: Option<&str>,
+    body: Option<&str>,
+) -> Result<LearnSource, ActionError> {
+    match (message_id, body) {
+        (Some(id), None) => inbound_numeric_id(id)
+            .map(LearnSource::Message)
+            .ok_or_else(|| ActionError::Validation("message_id must be 'in:<number>'".into())),
+        (None, Some(body)) => Ok(LearnSource::Body(body.to_string())),
+        _ => Err(ActionError::Validation(
+            "provide exactly one of message_id and body".into(),
+        )),
+    }
 }
 
 pub const SEARCH_LIMIT: usize = 20;
@@ -646,6 +760,7 @@ pub async fn open_topic(
             default_e164,
             title: title.clone(),
             ignored: false,
+            sort: None,
         })?;
         return Ok(Opened {
             contact_id: Some(contact.id),
@@ -664,6 +779,7 @@ pub async fn open_topic(
             default_e164: Some(e164),
             title: title.clone(),
             ignored: false,
+            sort: None,
         })?;
         return Ok(Opened {
             contact_id: None,
@@ -704,6 +820,7 @@ async fn resolve_send_thread(
                 default_e164: Some(default_e164),
                 title,
                 ignored: false,
+                sort: None,
             })?;
             thread_id
         }
@@ -719,6 +836,7 @@ async fn resolve_send_thread(
                     default_e164: Some(dest.clone()),
                     title: dest,
                     ignored: false,
+                    sort: None,
                 })?;
                 thread_id
             }
@@ -870,6 +988,7 @@ mod tests {
             default_e164: Some("+989121234567".into()),
             title: "Ali".into(),
             ignored: false,
+            sort: None,
         })
         .unwrap();
         (db, id)
@@ -912,6 +1031,7 @@ mod tests {
                 default_e164: Some(e164.into()),
                 title: title.into(),
                 ignored: false,
+                sort: None,
             })
             .unwrap();
         }
@@ -953,17 +1073,39 @@ mod tests {
     #[test]
     fn list_messages_unknown_thread_404() {
         let db = Db::open_in_memory().unwrap();
-        let err = list_messages(&db, "IR", 99, None, None, None, None, None).unwrap_err();
+        let err = list_messages(
+            &db,
+            "IR",
+            99,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &MessageFilter::default(),
+        )
+        .unwrap_err();
         assert!(matches!(err, ActionError::NotFound(_)));
     }
 
     #[test]
     fn list_messages_general_without_topic_ok() {
         let db = Db::open_in_memory().unwrap();
-        db.record_inbound("/g", "+98912", "x", None, "", GENERAL_THREAD)
+        db.record_inbound("/g", "+98912", "x", None, "", GENERAL_THREAD, None, None)
             .unwrap();
 
-        let out = list_messages(&db, "IR", GENERAL_THREAD, None, None, None, None, None).unwrap();
+        let out = list_messages(
+            &db,
+            "IR",
+            GENERAL_THREAD,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &MessageFilter::default(),
+        )
+        .unwrap();
 
         assert_eq!(out.thread_id, GENERAL_THREAD);
         assert_eq!(out.title, "General");
@@ -974,8 +1116,18 @@ mod tests {
     #[test]
     fn list_messages_general_rejects_contact_id() {
         let db = Db::open_in_memory().unwrap();
-        let err =
-            list_messages(&db, "IR", GENERAL_THREAD, None, None, None, None, Some(7)).unwrap_err();
+        let err = list_messages(
+            &db,
+            "IR",
+            GENERAL_THREAD,
+            None,
+            None,
+            None,
+            None,
+            Some(7),
+            &MessageFilter::default(),
+        )
+        .unwrap_err();
         assert!(matches!(err, ActionError::IdentityConflict));
     }
 
@@ -991,6 +1143,7 @@ mod tests {
             None,
             Some("09121234567"),
             None,
+            &MessageFilter::default(),
         )
         .unwrap();
         assert_eq!(out.title, "General");
@@ -1006,9 +1159,21 @@ mod tests {
             default_e164: Some("+989121111111".into()),
             title: "Ali".into(),
             ignored: false,
+            sort: None,
         })
         .unwrap();
-        let err = list_messages(&db, "IR", 42, None, None, None, None, Some(id + 1)).unwrap_err();
+        let err = list_messages(
+            &db,
+            "IR",
+            42,
+            None,
+            None,
+            None,
+            None,
+            Some(id + 1),
+            &MessageFilter::default(),
+        )
+        .unwrap_err();
         assert!(matches!(err, ActionError::IdentityConflict));
     }
 
@@ -1027,6 +1192,7 @@ mod tests {
             None,
             Some("09131234567"),
             Some(id),
+            &MessageFilter::default(),
         )
         .unwrap();
 
@@ -1045,6 +1211,7 @@ mod tests {
             None,
             Some("09139999999"),
             Some(id),
+            &MessageFilter::default(),
         )
         .unwrap_err();
         assert!(matches!(err, ActionError::IdentityConflict));
@@ -1059,11 +1226,22 @@ mod tests {
             default_e164: Some("+989121111111".into()),
             title: "Unknown".into(),
             ignored: false,
+            sort: None,
         })
         .unwrap();
 
-        let err =
-            list_messages(&db, "IR", 42, None, None, None, Some("09122222222"), None).unwrap_err();
+        let err = list_messages(
+            &db,
+            "IR",
+            42,
+            None,
+            None,
+            None,
+            Some("09122222222"),
+            None,
+            &MessageFilter::default(),
+        )
+        .unwrap_err();
 
         assert!(matches!(err, ActionError::IdentityConflict));
     }
@@ -1077,12 +1255,24 @@ mod tests {
             default_e164: Some("+98912".into()),
             title: "Unknown".into(),
             ignored: false,
+            sort: None,
         })
         .unwrap();
         db.insert_inbound_at("/m", "+98912", "hello", "2026-08-20T08:00:00Z", Some(42))
             .unwrap();
 
-        let out = list_messages(&db, "IR", 42, Some(1), None, None, None, None).unwrap();
+        let out = list_messages(
+            &db,
+            "IR",
+            42,
+            Some(1),
+            None,
+            None,
+            None,
+            None,
+            &MessageFilter::default(),
+        )
+        .unwrap();
 
         assert_eq!(out.messages.len(), 1);
         assert_eq!(out.messages[0].body, "hello");
@@ -1332,6 +1522,7 @@ mod tests {
             default_e164: Some("+98912".into()),
             title: "Ali".into(),
             ignored: false,
+            sort: None,
         })
         .unwrap();
         let tg = crate::app::FakeTg::new();
@@ -1463,6 +1654,7 @@ mod tests {
             default_e164: None,
             title: "Ali".into(),
             ignored: false,
+            sort: None,
         })
         .unwrap();
         let tg = crate::app::FakeTg::new();

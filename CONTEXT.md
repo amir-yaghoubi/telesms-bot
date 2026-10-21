@@ -64,6 +64,48 @@ _Avoid_: Offset, page, since
 The delivery of the messages a client missed, fetched by cursor when it reconnects.
 _Avoid_: Backfill, history, catch-up
 
+**Classifier**:
+The optional external decision maker (a SystemOne-protocol server) the gateway asks what kind of
+SMS an inbound message is. The gateway works fully without it.
+_Avoid_: AI, model, LLM, spam filter
+
+**Classification**:
+The classifier's verdict on one inbound Message: exactly one Category, its confidence, and zero or
+more Tags. Outbound messages never have one; an inbound message may have none yet.
+_Avoid_: Label, prediction, result
+
+**Category**:
+What an inbound SMS is from the recipient's point of view: `transactional`, `promotional`,
+`broadcast`, `feedback`, `personal` or `other`. One per Classification. One-time codes are not a
+Category; they are found by OTP Patterns.
+_Avoid_: Type, kind, label
+
+**Tag**:
+A yes/no property of an inbound SMS independent of its Category, currently only `scam`
+(impersonation or phishing). A message may carry several.
+_Avoid_: Flag, label, category
+
+**Sort**:
+The gateway's decision about where a message that would land in General goes instead: `scam`,
+`otp`, one Category, or none (stays in General). Decided in that order of precedence; a
+low-confidence Classification sorts to none.
+_Avoid_: Label, bucket, route
+
+**Sorted Thread**:
+A Thread the gateway creates for one Sort and fills with messages that would otherwise land in
+General. Like General, it has no reply address of its own.
+_Avoid_: Category thread, ads topic, spam folder, bin
+
+**OTP Code**:
+The one-time code the gateway extracts from an inbound message body with an OTP Pattern. Found
+without the Classifier.
+_Avoid_: Password, PIN, token
+
+**OTP Pattern**:
+A learned rule that locates the OTP Code in a message body. The gateway learns one when the user
+points at the code in a sample message.
+_Avoid_: Regex, rule, template
+
 ## Relationships
 
 - A **Gateway** owns many **Threads**, **Contacts** and **Messages**.
@@ -73,6 +115,12 @@ _Avoid_: Backfill, history, catch-up
   channel.
 - A **Command** is answered by an acknowledgement or an error, never by an **Event**.
 - A **Cursor** turns a reconnection into a **Replay**.
+- An inbound **Message** has at most one **Classification**; a **Classification** has one
+  **Category** and any number of **Tags**.
+- Only a message that would land in **General** gets a **Sort**; a message for a contact's thread
+  stays there whatever its **Classification** or **OTP Code**.
+- A **Sorted Thread** belongs to exactly one **Sort**.
+- An **OTP Pattern** yields an **OTP Code**; the **Classifier** never does.
 
 ## Invariants
 

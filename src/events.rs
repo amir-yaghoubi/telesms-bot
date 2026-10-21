@@ -7,13 +7,13 @@
 
 use tokio::sync::broadcast;
 
-use crate::db::MessageRow;
+use crate::db::{Classification, MessageRow};
 
 /// How many announcements the bus buffers per subscriber.
 pub const EVENT_BUFFER: usize = 256;
 
 /// A message the gateway announces to realtime subscribers.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct MessageEvent {
     /// Message id in the API's format: `in:<rowid>` or `out:<rowid>`.
     pub id: String,
@@ -28,6 +28,12 @@ pub struct MessageEvent {
     /// `ok` or `failed`.
     pub status: String,
     pub thread_id: i32,
+    /// The sorting decision for an inbound SMS, when one was made.
+    pub classification: Option<Classification>,
+    /// The OTP code found in the SMS, when one was found.
+    pub otp_code: Option<String>,
+    /// True when the message was changed after it was first announced.
+    pub updated: bool,
 }
 
 impl From<MessageRow> for MessageEvent {
@@ -41,6 +47,19 @@ impl From<MessageRow> for MessageEvent {
             sms_ts: row.sms_ts,
             status: row.status,
             thread_id: row.thread_id,
+            classification: row.classification,
+            otp_code: row.otp_code,
+            updated: false,
+        }
+    }
+}
+
+impl MessageEvent {
+    /// Announce that a recorded message changed, such as a late classification.
+    pub fn updated(row: MessageRow) -> Self {
+        Self {
+            updated: true,
+            ..Self::from(row)
         }
     }
 }
@@ -87,6 +106,9 @@ mod tests {
             sms_ts: None,
             status: "ok".into(),
             thread_id: 1,
+            classification: None,
+            otp_code: None,
+            updated: false,
         }
     }
 
@@ -127,10 +149,32 @@ mod tests {
             sms_ts: Some("2026-10-20T09:59:58+00:00".into()),
             status: "ok".into(),
             thread_id: 9,
+            classification: None,
+            otp_code: None,
         };
         let event = MessageEvent::from(row);
         assert_eq!(event.id, "in:7");
         assert_eq!(event.thread_id, 9);
         assert_eq!(event.sms_ts.as_deref(), Some("2026-10-20T09:59:58+00:00"));
+        assert!(!event.updated);
+    }
+
+    #[test]
+    fn an_updated_row_is_flagged_as_an_update() {
+        let row = MessageRow {
+            id: "in:8".into(),
+            direction: "in".into(),
+            e164: "+989121234567".into(),
+            body: "hello".into(),
+            timestamp: "2026-10-20T10:00:00+00:00".into(),
+            sms_ts: None,
+            status: "ok".into(),
+            thread_id: 9,
+            classification: None,
+            otp_code: Some("402332".into()),
+        };
+        let event = MessageEvent::updated(row);
+        assert!(event.updated);
+        assert_eq!(event.otp_code.as_deref(), Some("402332"));
     }
 }

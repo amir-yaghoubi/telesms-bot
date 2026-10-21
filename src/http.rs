@@ -4,7 +4,7 @@ use axum::extract::{FromRequest, Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 use crate::actions::{self, ActionError, Identity, NumberState, Opened, SmsSent, Who};
 use crate::app::AppState;
 use crate::route::GENERAL_THREAD;
+use crate::sorting::learn::learn_otp;
 
 pub fn router(state: AppState) -> Router {
     let api = Router::new()
@@ -28,6 +29,12 @@ pub fn router(state: AppState) -> Router {
         .route("/call-forward", get(call_forward_get).put(call_forward_put))
         .route("/chats", get(chats_handler))
         .route("/chats/{thread_id}/messages", get(chat_messages_handler))
+        .route(
+            "/otp-patterns",
+            get(otp_patterns_list).post(otp_patterns_add),
+        )
+        .route("/otp-patterns/learn", post(otp_patterns_learn))
+        .route("/otp-patterns/{id}", delete(otp_patterns_delete))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -435,6 +442,8 @@ struct HistoryQuery {
     after: Option<String>,
     number: Option<String>,
     contact_id: Option<i64>,
+    category: Option<String>,
+    tag: Option<String>,
 }
 
 async fn chats_handler(
@@ -487,6 +496,10 @@ async fn chat_messages_handler(
             );
         }
     };
+    let filter = match actions::message_filter(q.category.as_deref(), q.tag.as_deref()) {
+        Ok(filter) => filter,
+        Err(err) => return action_to_response(err).into_response(),
+    };
     match actions::list_messages(
         state.db.as_ref(),
         &state.cfg.default_region,
@@ -496,9 +509,106 @@ async fn chat_messages_handler(
         q.after.as_deref(),
         q.number.as_deref(),
         q.contact_id,
+        &filter,
     ) {
         Ok(body) => (StatusCode::OK, Json(body)).into_response(),
         Err(err) => action_to_response(err).into_response(),
+    }
+}
+
+async fn otp_patterns_list(State(state): State<AppState>) -> Response {
+    match state.db.otp_patterns() {
+        Ok(patterns) => Json(json!({ "patterns": patterns })).into_response(),
+        Err(err) => action_to_response(err.into()).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PatternReq {
+    #[serde(default)]
+    name: Option<String>,
+    pattern: String,
+}
+
+async fn otp_patterns_add(
+    State(state): State<AppState>,
+    ApiJson(body): ApiJson<PatternReq>,
+) -> Response {
+    match actions::add_otp_pattern(state.db.as_ref(), body.name.as_deref(), &body.pattern) {
+        Ok((row, created)) => {
+            let status = if created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            };
+            (status, Json(row)).into_response()
+        }
+        Err(err) => action_to_response(err).into_response(),
+    }
+}
+
+async fn otp_patterns_delete(
+    State(state): State<AppState>,
+    path: Result<Path<i64>, PathRejection>,
+) -> Response {
+    let Path(id) = match path {
+        Ok(path) => path,
+        Err(rejection) => {
+            return api_error_response(
+                StatusCode::BAD_REQUEST,
+                "validation",
+                &rejection.to_string(),
+            );
+        }
+    };
+    match actions::delete_otp_pattern(state.db.as_ref(), id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => action_to_response(err).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct LearnReq {
+    #[serde(default)]
+    message_id: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+    code: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+async fn otp_patterns_learn(
+    State(state): State<AppState>,
+    ApiJson(body): ApiJson<LearnReq>,
+) -> Response {
+    let source = match actions::learn_source(body.message_id.as_deref(), body.body.as_deref()) {
+        Ok(source) => source,
+        Err(err) => return action_to_response(err).into_response(),
+    };
+    let name = body
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty());
+    match learn_otp(
+        state.db.as_ref(),
+        state.tg.as_ref(),
+        &state.bus,
+        &state.sorting.config,
+        source,
+        &body.code,
+        name,
+    )
+    .await
+    {
+        Ok(learned) => Json(json!({
+            "pattern": learned.pattern,
+            "created": learned.created,
+            "message": learned.message.map(actions::MessageItem::from),
+        }))
+        .into_response(),
+        Err(err) => action_to_response(err.into()).into_response(),
     }
 }
 
@@ -581,6 +691,9 @@ mod tests {
             ws_enabled: false,
             ws_bind: "127.0.0.1".into(),
             ws_port: 8788,
+            classifier_url: None,
+            classifier_model: None,
+            sorting_config_path: None,
         }
     }
 
@@ -596,6 +709,7 @@ mod tests {
                 default_e164: Some("+989121234567".into()),
                 title: "Ali".into(),
                 ignored: false,
+                sort: None,
             })
             .unwrap();
             db
@@ -613,6 +727,7 @@ mod tests {
             forward,
             tg,
             bus: crate::events::EventBus::new(crate::events::EVENT_BUFFER),
+            sorting: crate::sorting::Sorting::disabled(),
         })
     }
 
@@ -968,9 +1083,10 @@ mod tests {
                 default_e164: Some("+989121234567".into()),
                 title: "Ali".into(),
                 ignored: false,
+                sort: None,
             })
             .unwrap();
-            db.record_inbound("/g", "+989121234567", "hello", None, "", 9)
+            db.record_inbound("/g", "+989121234567", "hello", None, "", 9, None, None)
                 .unwrap();
             db
         });
@@ -987,6 +1103,7 @@ mod tests {
             forward,
             tg,
             bus: crate::events::EventBus::new(crate::events::EVENT_BUFFER),
+            sorting: crate::sorting::Sorting::disabled(),
         })
     }
 
@@ -1008,5 +1125,352 @@ mod tests {
         assert_eq!(v["thread_id"], 9);
         assert_eq!(v["messages"].as_array().unwrap().len(), 1);
         assert_eq!(v["messages"][0]["body"], "hello");
+    }
+
+    fn sorting_db() -> Arc<Db> {
+        let db = Db::open_in_memory().unwrap();
+        let id = db.upsert_contact("people/a", "Ali").unwrap();
+        db.replace_contact_numbers(id, &["+989121234567".into()])
+            .unwrap();
+        for (thread_id, contact_id, title) in [(9, Some(id), "Ali"), (15, None, "+989129990000")] {
+            db.upsert_topic(&Topic {
+                thread_id,
+                contact_id,
+                default_e164: None,
+                title: title.into(),
+                ignored: false,
+                sort: None,
+            })
+            .unwrap();
+        }
+        db.upsert_sorted_topic("promotional", 12, "Promotions")
+            .unwrap();
+        Arc::new(db)
+    }
+
+    fn stored(category: &str, confidence: f64, tags: &[&str]) -> crate::db::StoredClassification {
+        crate::db::StoredClassification {
+            public: crate::db::Classification {
+                category: category.into(),
+                confidence,
+                tags: tags.iter().map(|t| t.to_string()).collect(),
+            },
+            scores: json!({}),
+        }
+    }
+
+    fn router_for(api_key: &str, db: Arc<Db>) -> Router {
+        let modem = Arc::new(FakeModem::default());
+        let info = modem.clone() as Arc<dyn ModemInfo>;
+        let forward = modem.clone() as Arc<dyn CallForward>;
+        let modem = modem as Arc<dyn SmsModem>;
+        let tg = Arc::new(FakeTg::new()) as Arc<dyn TelegramSink>;
+        router(AppState {
+            cfg: test_config(api_key),
+            db,
+            modem,
+            info,
+            forward,
+            tg,
+            bus: crate::events::EventBus::new(crate::events::EVENT_BUFFER),
+            sorting: crate::sorting::Sorting::disabled(),
+        })
+    }
+
+    fn get(uri: &str) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .uri(uri)
+            .header("X-Api-Key", "k")
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn send_json(method: &str, uri: &str, body: &str) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("X-Api-Key", "k")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn delete(uri: &str) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method("DELETE")
+            .uri(uri)
+            .header("X-Api-Key", "k")
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn messages_include_classification_and_otp_code() {
+        let db = sorting_db();
+        let c = stored("transactional", 0.9, &["scam"]);
+        db.record_inbound(
+            "/1",
+            "+989121234567",
+            "code 123456",
+            None,
+            "",
+            9,
+            Some("123456"),
+            Some(&c),
+        )
+        .unwrap();
+        db.record_inbound("/2", "+989121234567", "plain", None, "", 9, None, None)
+            .unwrap();
+        let res = call(router_for("k", db), get("/api/v1/chats/9/messages")).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        let messages = v["messages"].as_array().unwrap();
+        let with = messages
+            .iter()
+            .find(|m| m["body"] == "code 123456")
+            .unwrap();
+        assert_eq!(
+            with["classification"],
+            json!({"category": "transactional", "confidence": 0.9, "tags": ["scam"]})
+        );
+        assert_eq!(with["otp_code"], "123456");
+        let without = messages.iter().find(|m| m["body"] == "plain").unwrap();
+        assert_eq!(without["classification"], Value::Null);
+        assert_eq!(without["otp_code"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn messages_filter_by_category_and_tag() {
+        let db = sorting_db();
+        for (path, body, c) in [
+            ("/1", "promo", stored("promotional", 0.8, &[])),
+            ("/2", "scam promo", stored("promotional", 0.7, &["scam"])),
+            ("/3", "bank", stored("transactional", 0.9, &[])),
+        ] {
+            db.record_inbound(path, "+989121234567", body, None, "", 9, None, Some(&c))
+                .unwrap();
+        }
+        let app = router_for("k", db);
+
+        let res = call(
+            app.clone(),
+            get("/api/v1/chats/9/messages?category=promotional"),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(res).await["messages"].as_array().unwrap().len(),
+            2
+        );
+
+        let res = call(app.clone(), get("/api/v1/chats/9/messages?tag=scam")).await;
+        let v = body_json(res).await;
+        assert_eq!(v["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(v["messages"][0]["body"], "scam promo");
+
+        let res = call(
+            app,
+            get("/api/v1/chats/9/messages?category=transactional&tag=scam"),
+        )
+        .await;
+        assert_eq!(body_json(res).await["messages"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn unknown_category_is_validation_error() {
+        let app = router_for("k", sorting_db());
+        for uri in [
+            "/api/v1/chats/9/messages?category=bogus",
+            "/api/v1/chats/9/messages?tag=bogus",
+        ] {
+            let res = call(app.clone(), get(uri)).await;
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{uri}");
+            let v = body_json(res).await;
+            assert_eq!(v["error"], "validation", "{uri}");
+            assert!(v["message"].is_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn chats_report_kind_and_sort() {
+        let db = sorting_db();
+        for (path, thread_id) in [("/1", 1), ("/2", 9), ("/3", 12), ("/4", 15)] {
+            db.record_inbound(path, "+989121234567", "hi", None, "", thread_id, None, None)
+                .unwrap();
+        }
+        let res = call(router_for("k", db), get("/api/v1/chats")).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        let chats = v["chats"].as_array().unwrap();
+        let find = |id: i64| chats.iter().find(|c| c["thread_id"] == id).unwrap();
+        assert_eq!(find(1)["kind"], "general");
+        assert_eq!(find(1)["sort"], Value::Null);
+        assert_eq!(find(9)["kind"], "contact");
+        assert_eq!(find(12)["kind"], "sorted");
+        assert_eq!(find(12)["sort"], "promotional");
+        assert_eq!(find(15)["kind"], "number");
+    }
+
+    #[tokio::test]
+    async fn patterns_crud() {
+        let app = router_for("k", sorting_db());
+        let res = call(app.clone(), get("/api/v1/otp-patterns")).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await, json!({"patterns": []}));
+
+        let body = r#"{"name":"bank","pattern":"code\\s+(\\d{4,8})"}"#;
+        let res = call(app.clone(), send_json("POST", "/api/v1/otp-patterns", body)).await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let created = body_json(res).await;
+        assert_eq!(created["name"], "bank");
+        assert_eq!(created["pattern"], r"code\s+(\d{4,8})");
+        assert!(created["created_at"].is_string());
+        let id = created["id"].as_i64().unwrap();
+
+        let res = call(app.clone(), send_json("POST", "/api/v1/otp-patterns", body)).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await["id"], id);
+
+        let res = call(app.clone(), get("/api/v1/otp-patterns")).await;
+        let v = body_json(res).await;
+        assert_eq!(v["patterns"].as_array().unwrap().len(), 1);
+        assert_eq!(v["patterns"][0], created);
+
+        let res = call(app.clone(), delete(&format!("/api/v1/otp-patterns/{id}"))).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let res = call(app.clone(), delete(&format!("/api/v1/otp-patterns/{id}"))).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(res).await["error"], "not_found");
+
+        let res = call(app, get("/api/v1/otp-patterns")).await;
+        assert_eq!(body_json(res).await, json!({"patterns": []}));
+    }
+
+    #[tokio::test]
+    async fn posting_loose_pattern_is_rejected() {
+        let app = router_for("k", sorting_db());
+        let res = call(
+            app,
+            send_json(
+                "POST",
+                "/api/v1/otp-patterns",
+                r#"{"pattern":":\\s+(\\d{4,8})"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let v = body_json(res).await;
+        assert_eq!(v["error"], "validation");
+        assert!(!v["message"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn learn_from_message_returns_updated_message() {
+        let db = sorting_db();
+        db.record_inbound(
+            "/1",
+            "+989121234567",
+            "Your verification code 402332 for login",
+            None,
+            "",
+            9,
+            None,
+            None,
+        )
+        .unwrap();
+        let app = router_for("k", db.clone());
+        let res = call(
+            app.clone(),
+            send_json(
+                "POST",
+                "/api/v1/otp-patterns/learn",
+                r#"{"message_id":"in:1","code":"402332","name":"login"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert_eq!(v["created"], true);
+        assert_eq!(v["pattern"]["name"], "login");
+        assert_eq!(v["message"]["id"], "in:1");
+        assert_eq!(v["message"]["otp_code"], "402332");
+        assert_eq!(db.otp_patterns().unwrap().len(), 1);
+
+        let res = call(app, get("/api/v1/chats/9/messages")).await;
+        assert_eq!(body_json(res).await["messages"][0]["otp_code"], "402332");
+    }
+
+    #[tokio::test]
+    async fn learn_from_body_has_no_message() {
+        let app = router_for("k", sorting_db());
+        let res = call(
+            app,
+            send_json(
+                "POST",
+                "/api/v1/otp-patterns/learn",
+                r#"{"body":"Your verification code 402332 for login","code":"402332"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert_eq!(v["created"], true);
+        assert_eq!(v["message"], Value::Null);
+        assert!(v["pattern"]["id"].is_i64());
+    }
+
+    #[tokio::test]
+    async fn learn_requires_exactly_one_source() {
+        let app = router_for("k", sorting_db());
+        let cases = [
+            (r#"{"code":"402332"}"#, StatusCode::BAD_REQUEST),
+            (
+                r#"{"message_id":"in:1","body":"code 402332","code":"402332"}"#,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                r#"{"message_id":"out:1","code":"402332"}"#,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                r#"{"message_id":"nonsense","code":"402332"}"#,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                r#"{"message_id":"in:999","code":"402332"}"#,
+                StatusCode::NOT_FOUND,
+            ),
+            (r#"{"body":"code 402332"}"#, StatusCode::BAD_REQUEST),
+        ];
+        for (body, status) in cases {
+            let res = call(
+                app.clone(),
+                send_json("POST", "/api/v1/otp-patterns/learn", body),
+            )
+            .await;
+            assert_eq!(res.status(), status, "body: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn otp_routes_require_api_key() {
+        let app = router_for("k", sorting_db());
+        for (method, uri) in [
+            ("GET", "/api/v1/otp-patterns"),
+            ("POST", "/api/v1/otp-patterns"),
+            ("DELETE", "/api/v1/otp-patterns/1"),
+            ("POST", "/api/v1/otp-patterns/learn"),
+        ] {
+            let res = call(
+                app.clone(),
+                axum::http::Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{method} {uri}");
+        }
     }
 }

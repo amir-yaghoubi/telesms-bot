@@ -1,6 +1,6 @@
-pub mod call_forward;
 pub mod actions;
 pub mod app;
+pub mod call_forward;
 pub mod config;
 pub mod db;
 pub mod events;
@@ -9,7 +9,9 @@ pub mod http;
 pub mod modem;
 pub mod modem_mm;
 pub mod normalize;
+pub mod otp;
 pub mod route;
+pub mod sorting;
 pub mod status;
 pub mod telegram;
 pub mod ws;

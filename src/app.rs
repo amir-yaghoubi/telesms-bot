@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -7,13 +8,20 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::actions::ActionError;
-use crate::db::{Db, Topic};
+use crate::db::{Db, StoredClassification, Topic};
 use crate::events::{EventBus, MessageEvent};
 use crate::google::{ContactsSync, GoogleError};
 use crate::modem::{IncomingSms, ModemError, ModemInfo, SmsInbox, SmsModem};
 use crate::modem_mm::MmModem;
 use crate::normalize::normalize_e164;
-use crate::route::{plan_outbound, route_for_send, route_inbound, InboundDest, OutboundPlan, GENERAL_THREAD};
+use crate::otp::extract_code;
+use crate::route::{
+    plan_outbound, route_for_send, route_inbound, InboundDest, OutboundPlan, GENERAL_THREAD,
+};
+use crate::sorting::config::SortingConfig;
+use crate::sorting::decide::decide_sort;
+use crate::sorting::render::render_inbound;
+use crate::sorting::{Sorting, TEACH_CALLBACK};
 
 #[derive(Debug, Error)]
 pub enum AppError {
@@ -174,9 +182,7 @@ async fn sync_once(
     if let Some(available) = available {
         if let Some(event) = presence.peek(available) {
             let text = match event {
-                PresenceEvent::Offline => {
-                    "⚠️ Google contacts token dead — run cargo run -- auth"
-                }
+                PresenceEvent::Offline => "⚠️ Google contacts token dead — run cargo run -- auth",
                 PresenceEvent::Back => "google contacts back",
             };
             match tg.post(GENERAL_THREAD, text.to_string()).await {
@@ -261,6 +267,8 @@ pub struct AppState {
     pub tg: Arc<dyn TelegramSink>,
     /// Where the application layer announces recorded messages.
     pub bus: EventBus,
+    /// The sort config and Classifier, for the OTP learn endpoint.
+    pub sorting: crate::sorting::Sorting,
 }
 
 /// Dependencies the inbox watcher needs, kept together so the watcher and the
@@ -272,6 +280,7 @@ pub struct InboxWatch {
     pub delete_enabled: bool,
     /// Where the watcher announces the messages it handles.
     pub bus: EventBus,
+    pub sorting: Sorting,
 }
 
 pub async fn watch_inbox<I>(
@@ -296,6 +305,7 @@ pub async fn watch_inbox<I>(
                     watch.delete_enabled,
                     &cancel,
                     &watch.bus,
+                    &watch.sorting,
                 )
                 .await;
                 let mut stream = std::pin::pin!(stream);
@@ -311,6 +321,7 @@ pub async fn watch_inbox<I>(
                                 watch.delete_enabled,
                                 &cancel,
                                 &watch.bus,
+                                &watch.sorting,
                             )
                             .await;
                         }
@@ -327,6 +338,7 @@ pub async fn watch_inbox<I>(
                                 inbox.as_ref(),
                                 watch.delete_enabled,
                                 &watch.bus,
+                                &watch.sorting,
                             )
                             .await
                             {
@@ -352,6 +364,15 @@ pub const SEND_ACK: &str = "✅";
 pub const SEND_REACT_OK: &str = "👍";
 pub const SEND_FAIL: &str = "👎";
 
+/// A post with HTML, an optional silent flag and one row of inline buttons.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RichPost {
+    pub html: String,
+    pub silent: bool,
+    /// (label, callback data), laid out as one row.
+    pub buttons: Vec<(String, String)>,
+}
+
 #[async_trait::async_trait]
 pub trait TelegramSink: Send + Sync {
     async fn post(&self, thread_id: i32, text: String) -> Result<(), AppError>;
@@ -362,14 +383,37 @@ pub trait TelegramSink: Send + Sync {
         Err(AppError::Telegram("react not supported".into()))
     }
     async fn create_topic(&self, title: String) -> Result<i32, AppError>;
+    /// Posts HTML and returns the Telegram message id.
+    async fn post_rich(&self, _thread_id: i32, _post: RichPost) -> Result<i32, AppError> {
+        Err(AppError::Telegram("post_rich not supported".into()))
+    }
+    /// Replaces a message's text with HTML and drops its inline keyboard.
+    async fn edit_html(&self, _message_id: i32, _html: String) -> Result<(), AppError> {
+        Err(AppError::Telegram("edit_html not supported".into()))
+    }
+    /// Sends a force-reply prompt in the thread, replying to `reply_to` when given.
+    async fn prompt_reply(
+        &self,
+        _thread_id: i32,
+        _text: String,
+        _reply_to: Option<i32>,
+    ) -> Result<(), AppError> {
+        Err(AppError::Telegram("prompt_reply not supported".into()))
+    }
 }
 
 pub struct FakeTg {
     pub posts: Mutex<Vec<(i32, String)>>,
     pub replies: Mutex<Vec<(i32, String, i32)>>,
     pub reactions: Mutex<Vec<(i32, String)>>,
+    pub rich_posts: Mutex<Vec<(i32, RichPost)>>,
+    pub edits: Mutex<Vec<(i32, String)>>,
+    pub prompts: Mutex<Vec<(i32, String, Option<i32>)>>,
     pub next_thread: AtomicI32,
+    pub next_message: AtomicI32,
     pub fail: AtomicBool,
+    /// Threads deleted in Telegram: posting into them fails.
+    pub missing_threads: Mutex<HashSet<i32>>,
 }
 
 impl FakeTg {
@@ -378,8 +422,13 @@ impl FakeTg {
             posts: Mutex::new(Vec::new()),
             replies: Mutex::new(Vec::new()),
             reactions: Mutex::new(Vec::new()),
+            rich_posts: Mutex::new(Vec::new()),
+            edits: Mutex::new(Vec::new()),
+            prompts: Mutex::new(Vec::new()),
             next_thread: AtomicI32::new(100),
+            next_message: AtomicI32::new(500),
             fail: AtomicBool::new(false),
+            missing_threads: Mutex::new(HashSet::new()),
         }
     }
 }
@@ -431,8 +480,57 @@ impl TelegramSink for FakeTg {
         }
         Ok(self.next_thread.fetch_add(1, Ordering::SeqCst))
     }
+
+    async fn post_rich(&self, thread_id: i32, post: RichPost) -> Result<i32, AppError> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(AppError::Telegram("fail".into()));
+        }
+        if self
+            .missing_threads
+            .lock()
+            .expect("fake tg missing threads lock")
+            .contains(&thread_id)
+        {
+            return Err(AppError::Telegram(
+                "Bad Request: message thread not found".into(),
+            ));
+        }
+        self.rich_posts
+            .lock()
+            .expect("fake tg rich posts lock")
+            .push((thread_id, post));
+        Ok(self.next_message.fetch_add(1, Ordering::SeqCst))
+    }
+
+    async fn edit_html(&self, message_id: i32, html: String) -> Result<(), AppError> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(AppError::Telegram("fail".into()));
+        }
+        self.edits
+            .lock()
+            .expect("fake tg edits lock")
+            .push((message_id, html));
+        Ok(())
+    }
+
+    async fn prompt_reply(
+        &self,
+        thread_id: i32,
+        text: String,
+        reply_to: Option<i32>,
+    ) -> Result<(), AppError> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(AppError::Telegram("fail".into()));
+        }
+        self.prompts
+            .lock()
+            .expect("fake tg prompts lock")
+            .push((thread_id, text, reply_to));
+        Ok(())
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn drain_listed_sms<I>(
     inbox: &I,
     db: &Db,
@@ -441,6 +539,7 @@ async fn drain_listed_sms<I>(
     delete_enabled: bool,
     cancel: &CancellationToken,
     bus: &EventBus,
+    sorting: &Sorting,
 ) where
     I: SmsInbox,
 {
@@ -453,9 +552,17 @@ async fn drain_listed_sms<I>(
                 if cancel.is_cancelled() {
                     return;
                 }
-                if let Err(err) =
-                    handle_incoming_then_delete(db, region, sms, tg, inbox, delete_enabled, bus)
-                        .await
+                if let Err(err) = handle_incoming_then_delete(
+                    db,
+                    region,
+                    sms,
+                    tg,
+                    inbox,
+                    delete_enabled,
+                    bus,
+                    sorting,
+                )
+                .await
                 {
                     tracing::error!(error = %err, "existing sms");
                 }
@@ -476,6 +583,7 @@ pub async fn maybe_delete(enabled: bool, modem: &dyn SmsModem, path: &str) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_incoming_then_delete(
     db: &Db,
     region: &str,
@@ -484,6 +592,7 @@ pub async fn handle_incoming_then_delete(
     modem: &dyn SmsModem,
     delete_enabled: bool,
     bus: &EventBus,
+    sorting: &Sorting,
 ) -> Result<(), AppError> {
     if sms.inbound && sms.text.is_empty() {
         tracing::info!(
@@ -494,7 +603,7 @@ pub async fn handle_incoming_then_delete(
         return Ok(());
     }
     let path = sms.path.clone();
-    match handle_incoming(db, region, sms, tg, bus).await {
+    match handle_incoming(db, region, sms, tg, bus, sorting).await {
         Ok(()) => {
             maybe_delete(delete_enabled, modem, &path).await;
             Ok(())
@@ -509,6 +618,7 @@ pub async fn handle_incoming(
     sms: IncomingSms,
     tg: &dyn TelegramSink,
     bus: &EventBus,
+    sorting: &Sorting,
 ) -> Result<(), AppError> {
     if !sms.inbound {
         return Ok(());
@@ -517,6 +627,8 @@ pub async fn handle_incoming(
     if db.seen_sms(&sms.path, &id_e164, &sms.text, &sms.timestamp)? {
         return Ok(());
     }
+    let patterns = sorting.patterns(db)?;
+    let otp_code = extract_code(&patterns, &sms.text).map(|(_, code)| code);
     if sms_too_old(&sms.timestamp) {
         tracing::info!(
             path = %sms.path,
@@ -527,18 +639,39 @@ pub async fn handle_incoming(
             InboundDest::ExistingTopic { thread_id, .. } => thread_id,
             InboundDest::CreateContactTopic { .. } | InboundDest::General { .. } => GENERAL_THREAD,
         };
-        announce_inbound(db, bus, &sms, &id_e164, thread_id)?;
+        let understood = Understood {
+            otp_code: otp_code.as_deref(),
+            classified: None,
+        };
+        announce_inbound(db, bus, &sms, &id_e164, thread_id, None, &understood)?;
         return Ok(());
     }
 
-    match deliver_incoming(db, region, &sms, tg).await {
-        Ok(Delivered::Normalized { e164, thread_id }) => {
+    let classified = classify_inbound(sorting, &id_e164, &sms.text).await;
+    let understood = Understood {
+        otp_code: otp_code.as_deref(),
+        classified: classified.as_ref(),
+    };
+    match deliver_incoming(db, region, &sms, tg, sorting, &understood).await {
+        Ok(Delivered::Normalized {
+            e164,
+            thread_id,
+            tg_msg,
+        }) => {
             db.mark_incoming(&e164)?;
-            announce_inbound(db, bus, &sms, &e164, thread_id)?;
+            announce_inbound(db, bus, &sms, &e164, thread_id, Some(tg_msg), &understood)?;
             Ok(())
         }
-        Ok(Delivered::Raw { thread_id }) => {
-            announce_inbound(db, bus, &sms, &id_e164, thread_id)?;
+        Ok(Delivered::Raw { thread_id, tg_msg }) => {
+            announce_inbound(
+                db,
+                bus,
+                &sms,
+                &id_e164,
+                thread_id,
+                Some(tg_msg),
+                &understood,
+            )?;
             Ok(())
         }
         Err(err) => {
@@ -555,6 +688,29 @@ pub async fn handle_incoming(
     }
 }
 
+/// What the gateway understood about an inbound message before posting it.
+struct Understood<'a> {
+    otp_code: Option<&'a str>,
+    classified: Option<&'a StoredClassification>,
+}
+
+/// The Classification of an inbound message. A failure is not an error: the
+/// message is delivered unclassified and classified again later.
+async fn classify_inbound(
+    sorting: &Sorting,
+    e164: &str,
+    body: &str,
+) -> Option<StoredClassification> {
+    let classifier = sorting.classifier.as_ref()?;
+    match classifier.classify(e164, body).await {
+        Ok(classified) => Some(classified),
+        Err(err) => {
+            tracing::warn!(e164, error = %err, "classify inbound sms failed");
+            None
+        }
+    }
+}
+
 /// Record an inbound SMS and announce it to realtime subscribers.
 fn announce_inbound(
     db: &Db,
@@ -562,8 +718,19 @@ fn announce_inbound(
     sms: &IncomingSms,
     e164: &str,
     thread_id: i32,
+    tg_msg: Option<i32>,
+    understood: &Understood<'_>,
 ) -> Result<(), AppError> {
-    let row = db.record_inbound(&sms.path, e164, &sms.text, None, &sms.timestamp, thread_id)?;
+    let row = db.record_inbound(
+        &sms.path,
+        e164,
+        &sms.text,
+        tg_msg,
+        &sms.timestamp,
+        thread_id,
+        understood.otp_code,
+        understood.classified,
+    )?;
     bus.publish(MessageEvent::from(row));
     Ok(())
 }
@@ -658,28 +825,38 @@ fn sms_too_old(ts: &str) -> bool {
 }
 
 enum Delivered {
-    Normalized { e164: String, thread_id: i32 },
-    Raw { thread_id: i32 },
+    Normalized {
+        e164: String,
+        thread_id: i32,
+        tg_msg: i32,
+    },
+    Raw {
+        thread_id: i32,
+        tg_msg: i32,
+    },
 }
 
+/// Posts the message and returns where it landed. Nothing is recorded here:
+/// the caller records only after Telegram accepted the post, so a failed post
+/// leaves the message unseen and it is retried.
 async fn deliver_incoming(
     db: &Db,
     region: &str,
     sms: &IncomingSms,
     tg: &dyn TelegramSink,
+    sorting: &Sorting,
+    understood: &Understood<'_>,
 ) -> Result<Delivered, AppError> {
     let e164 = match normalize_e164(&sms.e164, region) {
         Ok(e164) => e164,
         Err(_) => {
-            tg.post(GENERAL_THREAD, format!("{}\n{}", sms.e164, sms.text))
-                .await?;
-            return Ok(Delivered::Raw {
-                thread_id: GENERAL_THREAD,
-            });
+            let (thread_id, tg_msg) =
+                post_to_general(db, tg, sorting, understood, sms, &sms.e164).await?;
+            return Ok(Delivered::Raw { thread_id, tg_msg });
         }
     };
 
-    let thread_id = match route_inbound(db, &e164)? {
+    let (thread_id, tg_msg) = match route_inbound(db, &e164)? {
         InboundDest::CreateContactTopic {
             contact_id,
             title,
@@ -692,9 +869,10 @@ async fn deliver_incoming(
                 default_e164: Some(default_e164),
                 title,
                 ignored: false,
+                sort: None,
             })?;
-            tg.post(thread_id, sms.text.clone()).await?;
-            thread_id
+            let tg_msg = post_inbound(tg, sorting, understood, thread_id, None, false, sms).await?;
+            (thread_id, tg_msg)
         }
         InboundDest::ExistingTopic {
             thread_id,
@@ -703,17 +881,137 @@ async fn deliver_incoming(
             if let Some(switched) = note_switch_to {
                 tg.post(thread_id, format!("now using {switched}")).await?;
             }
-            tg.post(thread_id, sms.text.clone()).await?;
-            thread_id
+            let tg_msg = post_inbound(tg, sorting, understood, thread_id, None, false, sms).await?;
+            (thread_id, tg_msg)
         }
         InboundDest::General { e164: dest_e164 } => {
-            tg.post(GENERAL_THREAD, format!("{dest_e164}\n{}", sms.text))
-                .await?;
-            GENERAL_THREAD
+            post_to_general(db, tg, sorting, understood, sms, &dest_e164).await?
         }
     };
 
-    Ok(Delivered::Normalized { e164, thread_id })
+    Ok(Delivered::Normalized {
+        e164,
+        thread_id,
+        tg_msg,
+    })
+}
+
+/// Posts a message that would land in General, in its Sorted Thread when it has a Sort.
+async fn post_to_general(
+    db: &Db,
+    tg: &dyn TelegramSink,
+    sorting: &Sorting,
+    understood: &Understood<'_>,
+    sms: &IncomingSms,
+    number: &str,
+) -> Result<(i32, i32), AppError> {
+    let sort = decide_sort(
+        understood.classified.map(|c| &c.public),
+        understood.otp_code,
+        &sorting.config,
+    );
+    let Some(sort) = sort else {
+        let tg_msg = post_inbound(
+            tg,
+            sorting,
+            understood,
+            GENERAL_THREAD,
+            Some(number),
+            false,
+            sms,
+        )
+        .await?;
+        return Ok((GENERAL_THREAD, tg_msg));
+    };
+    let silent = sorting.config.sorts[&sort].muted;
+    let mut thread_id = sorted_thread(db, tg, &sorting.config, &sort).await?;
+    let mut recreated = false;
+    loop {
+        match post_inbound(
+            tg,
+            sorting,
+            understood,
+            thread_id,
+            Some(number),
+            silent,
+            sms,
+        )
+        .await
+        {
+            Ok(tg_msg) => return Ok((thread_id, tg_msg)),
+            // The user deleted the topic in Telegram: make a new one, once.
+            Err(err) if !recreated && thread_is_gone(&err) => {
+                recreated = true;
+                tracing::warn!(sort = %sort, thread_id, "sorted thread is gone, recreating");
+                thread_id = create_sorted_thread(db, tg, &sorting.config, &sort).await?;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Whether Telegram rejected a post because the forum topic no longer exists.
+fn thread_is_gone(err: &AppError) -> bool {
+    let text = err.to_string().to_lowercase();
+    text.contains("thread not found") || text.contains("topic_deleted")
+}
+
+/// The thread for a Sort, created on first use.
+async fn sorted_thread(
+    db: &Db,
+    tg: &dyn TelegramSink,
+    cfg: &SortingConfig,
+    sort: &str,
+) -> Result<i32, AppError> {
+    if let Some(thread_id) = db.sorted_topic(sort)? {
+        return Ok(thread_id);
+    }
+    create_sorted_thread(db, tg, cfg, sort).await
+}
+
+/// Creates the topic for a Sort and makes it the Sort's thread, replacing any earlier one.
+async fn create_sorted_thread(
+    db: &Db,
+    tg: &dyn TelegramSink,
+    cfg: &SortingConfig,
+    sort: &str,
+) -> Result<i32, AppError> {
+    let title = cfg.sorts[sort].title.clone();
+    let thread_id = tg.create_topic(title.clone()).await?;
+    db.upsert_sorted_topic(sort, thread_id, &title)?;
+    Ok(thread_id)
+}
+
+async fn post_inbound(
+    tg: &dyn TelegramSink,
+    sorting: &Sorting,
+    understood: &Understood<'_>,
+    thread_id: i32,
+    number_line: Option<&str>,
+    silent: bool,
+    sms: &IncomingSms,
+) -> Result<i32, AppError> {
+    let post = render_inbound(
+        understood.classified.map(|c| &c.public),
+        understood.otp_code,
+        number_line,
+        &sms.text,
+        &sorting.config,
+    );
+    let buttons = if post.teach_button {
+        vec![("Teach code".to_string(), TEACH_CALLBACK.to_string())]
+    } else {
+        Vec::new()
+    };
+    tg.post_rich(
+        thread_id,
+        RichPost {
+            html: post.html,
+            silent,
+            buttons,
+        },
+    )
+    .await
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -821,8 +1119,10 @@ pub async fn handle_owner_text(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::Db;
+    use crate::db::{Classification, Db};
     use crate::modem::FakeModem;
+    use crate::sorting::classifier::{ClassifyError, FakeClassifier};
+    use crate::sorting::guard::GuardedClassifier;
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicUsize;
 
@@ -878,6 +1178,7 @@ mod tests {
             },
             &tg,
             &bus,
+            &Sorting::disabled(),
         )
         .await
         .unwrap();
@@ -961,12 +1262,13 @@ mod tests {
             },
             &tg,
             &bus(),
+            &Sorting::disabled(),
         )
         .await
         .unwrap();
-        let posts = tg.posts.lock().unwrap();
+        let posts = tg.rich_posts.lock().unwrap();
         assert_eq!(posts.len(), 1);
-        assert_eq!(posts[0].1, "hi");
+        assert_eq!(posts[0].1.html, "hi");
         assert!(db.get_topic_by_contact(id).unwrap().is_some());
     }
 
@@ -984,11 +1286,13 @@ mod tests {
             inbound: true,
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
-        handle_incoming(&db, "IR", sms.clone(), &tg, &bus())
+        handle_incoming(&db, "IR", sms.clone(), &tg, &bus(), &Sorting::disabled())
             .await
             .unwrap();
-        handle_incoming(&db, "IR", sms, &tg, &bus()).await.unwrap();
-        assert_eq!(tg.posts.lock().unwrap().len(), 1);
+        handle_incoming(&db, "IR", sms, &tg, &bus(), &Sorting::disabled())
+            .await
+            .unwrap();
+        assert_eq!(tg.rich_posts.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1005,9 +1309,13 @@ mod tests {
         };
         let mut b = a.clone();
         b.path = "/sms/2".into();
-        handle_incoming(&db, "IR", a, &tg, &bus()).await.unwrap();
-        handle_incoming(&db, "IR", b, &tg, &bus()).await.unwrap();
-        assert_eq!(tg.posts.lock().unwrap().len(), 1);
+        handle_incoming(&db, "IR", a, &tg, &bus(), &Sorting::disabled())
+            .await
+            .unwrap();
+        handle_incoming(&db, "IR", b, &tg, &bus(), &Sorting::disabled())
+            .await
+            .unwrap();
+        assert_eq!(tg.rich_posts.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1026,10 +1334,12 @@ mod tests {
             },
             &tg,
             &bus(),
+            &Sorting::disabled(),
         )
         .await
         .unwrap();
         assert!(tg.posts.lock().unwrap().is_empty());
+        assert!(tg.rich_posts.lock().unwrap().is_empty());
         assert!(db.seen_sms_path("/sms/old").unwrap());
     }
 
@@ -1047,6 +1357,7 @@ mod tests {
             default_e164: Some(a.into()),
             title: "Ali (0001)".into(),
             ignored: false,
+            sort: None,
         })
         .unwrap();
         let tg = FakeTg::new();
@@ -1062,10 +1373,12 @@ mod tests {
             },
             &tg,
             &bus(),
+            &Sorting::disabled(),
         )
         .await
         .unwrap();
         assert!(tg.posts.lock().unwrap().is_empty());
+        assert!(tg.rich_posts.lock().unwrap().is_empty());
         assert_eq!(
             db.get_topic_by_thread(42)
                 .unwrap()
@@ -1089,6 +1402,7 @@ mod tests {
             default_e164: Some("+989121234567".into()),
             title: "Ali (4567)".into(),
             ignored: false,
+            sort: None,
         })
         .unwrap();
         let tg = FakeTg {
@@ -1102,7 +1416,11 @@ mod tests {
             inbound: true,
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
-        assert!(handle_incoming(&db, "IR", sms, &tg, &bus()).await.is_err());
+        assert!(
+            handle_incoming(&db, "IR", sms, &tg, &bus(), &Sorting::disabled())
+                .await
+                .is_err()
+        );
         assert!(!db.seen_sms_path("/sms/1").unwrap());
     }
 
@@ -1136,6 +1454,7 @@ mod tests {
             default_e164: Some("+989121234567".into()),
             title: "Ali (4567)".into(),
             ignored: false,
+            sort: None,
         })
         .unwrap();
         let tg = FakeTg::new();
@@ -1236,6 +1555,37 @@ mod tests {
         assert_eq!(
             tg.reactions.lock().unwrap().as_slice(),
             &[(7, SEND_PENDING.into()), (7, SEND_REACT_OK.into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_tg_records_rich_posts_with_ids() {
+        let tg = FakeTg::new();
+        let first = RichPost {
+            html: "<b>a</b>".into(),
+            silent: true,
+            buttons: vec![("Move".into(), "mv:1".into())],
+        };
+        let second = RichPost {
+            html: "b".into(),
+            silent: false,
+            buttons: vec![],
+        };
+        assert_eq!(tg.post_rich(7, first.clone()).await.unwrap(), 500);
+        assert_eq!(tg.post_rich(8, second.clone()).await.unwrap(), 501);
+        assert_eq!(
+            tg.rich_posts.lock().unwrap().as_slice(),
+            &[(7, first), (8, second)]
+        );
+        tg.edit_html(500, "<i>x</i>".into()).await.unwrap();
+        tg.prompt_reply(7, "name?".into(), Some(9)).await.unwrap();
+        assert_eq!(
+            tg.edits.lock().unwrap().as_slice(),
+            &[(500, "<i>x</i>".into())]
+        );
+        assert_eq!(
+            tg.prompts.lock().unwrap().as_slice(),
+            &[(7, "name?".into(), Some(9))]
         );
     }
 
@@ -1404,6 +1754,7 @@ mod tests {
             tg: tg.clone(),
             delete_enabled: true,
             bus: bus(),
+            sorting: Sorting::disabled(),
         };
         let task = tokio::spawn(watch_inbox(
             modem.clone(),
@@ -1418,8 +1769,15 @@ mod tests {
             .expect("watch_inbox did not stop")
             .expect("watch_inbox join");
         assert_eq!(
-            tg.posts.lock().unwrap().as_slice(),
-            &[(1, "+989120000001\nhi".into())]
+            tg.rich_posts.lock().unwrap().as_slice(),
+            &[(
+                1,
+                RichPost {
+                    html: "+989120000001\nhi".into(),
+                    silent: false,
+                    buttons: vec![],
+                }
+            )]
         );
         assert_eq!(
             modem.deleted.lock().unwrap().as_slice(),
@@ -1439,6 +1797,7 @@ mod tests {
             default_e164: Some("+989121234567".into()),
             title: "Ali (4567)".into(),
             ignored: false,
+            sort: None,
         })
         .unwrap();
         let tg = FakeTg::new();
@@ -1477,6 +1836,7 @@ mod tests {
             default_e164: None,
             title: "Ali".into(),
             ignored: false,
+            sort: None,
         })
         .unwrap();
         let tg = FakeTg::new();
@@ -1515,6 +1875,7 @@ mod tests {
             default_e164: Some("+989121234567".into()),
             title: "Ali (4567)".into(),
             ignored: false,
+            sort: None,
         })
         .unwrap();
         let tg = FakeTg::new();
@@ -1547,6 +1908,7 @@ mod tests {
             default_e164: Some("+989121234567".into()),
             title: "Ali (4567)".into(),
             ignored: false,
+            sort: None,
         })
         .unwrap();
         let tg = FakeTg::new();
@@ -1579,6 +1941,7 @@ mod tests {
             default_e164: Some("+989121234567".into()),
             title: "Ali (4567)".into(),
             ignored: false,
+            sort: None,
         })
         .unwrap();
         let tg = FakeTg::new();
@@ -1646,6 +2009,7 @@ mod tests {
             &modem,
             true,
             &bus(),
+            &Sorting::disabled(),
         )
         .await
         .unwrap();
@@ -1664,13 +2028,31 @@ mod tests {
         let tg = FakeTg::new();
         let modem = FakeModem::default();
         let sms = sample_inbound("/sms/1");
-        handle_incoming_then_delete(&db, "IR", sms.clone(), &tg, &modem, true, &bus())
-            .await
-            .unwrap();
-        handle_incoming_then_delete(&db, "IR", sms, &tg, &modem, true, &bus())
-            .await
-            .unwrap();
-        assert_eq!(tg.posts.lock().unwrap().len(), 1);
+        handle_incoming_then_delete(
+            &db,
+            "IR",
+            sms.clone(),
+            &tg,
+            &modem,
+            true,
+            &bus(),
+            &Sorting::disabled(),
+        )
+        .await
+        .unwrap();
+        handle_incoming_then_delete(
+            &db,
+            "IR",
+            sms,
+            &tg,
+            &modem,
+            true,
+            &bus(),
+            &Sorting::disabled(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(tg.rich_posts.lock().unwrap().len(), 1);
         assert_eq!(
             modem.deleted.lock().unwrap().as_slice(),
             &["/sms/1".into(), "/sms/1".into()] as &[String]
@@ -1691,6 +2073,8 @@ mod tests {
             None,
             "2026-08-20T22:45:37+03:30",
             42,
+            None,
+            None,
         )
         .unwrap();
         let tg = FakeTg::new();
@@ -1702,19 +2086,37 @@ mod tests {
             inbound: true,
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
-        handle_incoming_then_delete(&db, "IR", sms.clone(), &tg, &modem, true, &bus())
-            .await
-            .unwrap();
-        assert_eq!(tg.posts.lock().unwrap().len(), 1);
+        handle_incoming_then_delete(
+            &db,
+            "IR",
+            sms.clone(),
+            &tg,
+            &modem,
+            true,
+            &bus(),
+            &Sorting::disabled(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(tg.rich_posts.lock().unwrap().len(), 1);
         assert_eq!(
             modem.deleted.lock().unwrap().as_slice(),
             &["/sms/1".into()] as &[String]
         );
         // A later sweep sees the same message again: deduped, no repost.
-        handle_incoming_then_delete(&db, "IR", sms, &tg, &modem, true, &bus())
-            .await
-            .unwrap();
-        assert_eq!(tg.posts.lock().unwrap().len(), 1);
+        handle_incoming_then_delete(
+            &db,
+            "IR",
+            sms,
+            &tg,
+            &modem,
+            true,
+            &bus(),
+            &Sorting::disabled(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(tg.rich_posts.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1736,10 +2138,12 @@ mod tests {
             &modem,
             true,
             &bus(),
+            &Sorting::disabled(),
         )
         .await
         .unwrap();
         assert!(tg.posts.lock().unwrap().is_empty());
+        assert!(tg.rich_posts.lock().unwrap().is_empty());
         assert_eq!(
             modem.deleted.lock().unwrap().as_slice(),
             &["/sms/old".into()] as &[String]
@@ -1765,6 +2169,7 @@ mod tests {
             &modem,
             true,
             &bus(),
+            &Sorting::disabled(),
         )
         .await
         .unwrap();
@@ -1786,6 +2191,7 @@ mod tests {
             default_e164: Some("+989121234567".into()),
             title: "Ali (4567)".into(),
             ignored: false,
+            sort: None,
         })
         .unwrap();
         let tg = FakeTg {
@@ -1801,6 +2207,7 @@ mod tests {
             &modem,
             true,
             &bus(),
+            &Sorting::disabled(),
         )
         .await
         .is_err());
@@ -1820,6 +2227,7 @@ mod tests {
             default_e164: Some("+989121234567".into()),
             title: "Ali (4567)".into(),
             ignored: false,
+            sort: None,
         })
         .unwrap();
         let tg = FakeTg::new();
@@ -1831,10 +2239,20 @@ mod tests {
             inbound: true,
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
-        handle_incoming_then_delete(&db, "IR", sms, &tg, &modem, true, &bus())
-            .await
-            .unwrap();
+        handle_incoming_then_delete(
+            &db,
+            "IR",
+            sms,
+            &tg,
+            &modem,
+            true,
+            &bus(),
+            &Sorting::disabled(),
+        )
+        .await
+        .unwrap();
         assert!(tg.posts.lock().unwrap().is_empty());
+        assert!(tg.rich_posts.lock().unwrap().is_empty());
         assert!(modem.deleted.lock().unwrap().is_empty());
         assert!(!db.seen_sms_path("/sms/empty").unwrap());
     }
@@ -1855,10 +2273,497 @@ mod tests {
             &modem,
             false,
             &bus(),
+            &Sorting::disabled(),
         )
         .await
         .unwrap();
         assert!(modem.deleted.lock().unwrap().is_empty());
+    }
+
+    fn stored(category: &str, confidence: f64, tags: &[&str]) -> StoredClassification {
+        StoredClassification {
+            public: Classification {
+                category: category.into(),
+                confidence,
+                tags: tags.iter().map(|t| t.to_string()).collect(),
+            },
+            scores: serde_json::json!({}),
+        }
+    }
+
+    fn sorting_with(answers: Vec<Result<StoredClassification, ClassifyError>>) -> Sorting {
+        Sorting {
+            config: Arc::new(SortingConfig::load(None).unwrap()),
+            classifier: Some(Arc::new(FakeClassifier::new(answers))),
+        }
+    }
+
+    fn unknown_sms(path: &str, text: &str) -> IncomingSms {
+        IncomingSms {
+            path: path.into(),
+            e164: "+989981600237".into(),
+            text: text.into(),
+            inbound: true,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    fn recorded(db: &Db) -> Vec<crate::db::MessageRow> {
+        db.messages_after("", 100).unwrap()
+    }
+
+    #[tokio::test]
+    async fn promotional_from_unknown_number_goes_to_muted_sorted_thread() {
+        let db = Db::open_in_memory().unwrap();
+        let tg = FakeTg::new();
+        let bus = bus();
+        let mut events = bus.subscribe();
+        let sorting = sorting_with(vec![Ok(stored("promotional", 0.9, &[]))]);
+
+        handle_incoming(
+            &db,
+            "IR",
+            unknown_sms("/sms/1", "off 50%"),
+            &tg,
+            &bus,
+            &sorting,
+        )
+        .await
+        .unwrap();
+
+        let tid = db
+            .sorted_topic("promotional")
+            .unwrap()
+            .expect("sorted topic");
+        assert_eq!(
+            db.get_topic_by_thread(tid).unwrap().unwrap().title,
+            "تبلیغاتی"
+        );
+        let posts = tg.rich_posts.lock().unwrap();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].0, tid);
+        assert!(posts[0].1.silent);
+        assert_eq!(
+            posts[0].1.html,
+            "🟨 <b>تبلیغاتی</b>\n+989981600237\noff 50%"
+        );
+        assert!(tg.posts.lock().unwrap().is_empty());
+        let announced = events.try_recv().expect("announced");
+        assert_eq!(announced.thread_id, tid);
+        assert_eq!(announced.classification.unwrap().category, "promotional");
+        let rows = recorded(&db);
+        assert_eq!(rows[0].thread_id, tid);
+        assert_eq!(
+            rows[0].classification.as_ref().unwrap().category,
+            "promotional"
+        );
+    }
+
+    #[tokio::test]
+    async fn second_promotional_reuses_sorted_thread() {
+        let db = Db::open_in_memory().unwrap();
+        let tg = FakeTg::new();
+        let sorting = sorting_with(vec![
+            Ok(stored("promotional", 0.9, &[])),
+            Ok(stored("promotional", 0.9, &[])),
+        ]);
+
+        for (path, text) in [("/sms/1", "first"), ("/sms/2", "second")] {
+            handle_incoming(&db, "IR", unknown_sms(path, text), &tg, &bus(), &sorting)
+                .await
+                .unwrap();
+        }
+
+        let tid = db.sorted_topic("promotional").unwrap().unwrap();
+        let posts = tg.rich_posts.lock().unwrap();
+        assert_eq!(
+            posts.iter().map(|p| p.0).collect::<Vec<_>>(),
+            vec![tid, tid]
+        );
+        assert_eq!(tg.next_thread.load(Ordering::SeqCst), 101);
+    }
+
+    #[tokio::test]
+    async fn otp_from_unknown_number_goes_to_loud_otp_thread() {
+        let db = Db::open_in_memory().unwrap();
+        db.add_otp_pattern(Some("bank"), r"رمز:\s+(\d{4,8})")
+            .unwrap();
+        let tg = FakeTg::new();
+        let bus = bus();
+        let mut events = bus.subscribe();
+        let sorting = sorting_with(vec![Ok(stored("transactional", 0.9, &[]))]);
+
+        handle_incoming(
+            &db,
+            "IR",
+            unknown_sms("/sms/1", "رمز: 402332"),
+            &tg,
+            &bus,
+            &sorting,
+        )
+        .await
+        .unwrap();
+
+        let tid = db.sorted_topic("otp").unwrap().expect("otp thread");
+        let posts = tg.rich_posts.lock().unwrap();
+        assert_eq!(posts[0].0, tid);
+        assert!(!posts[0].1.silent);
+        assert!(posts[0].1.html.contains("<code>402332</code>"));
+        assert!(posts[0].1.buttons.is_empty());
+        assert_eq!(recorded(&db)[0].otp_code.as_deref(), Some("402332"));
+        assert_eq!(
+            events.try_recv().expect("announced").otp_code.as_deref(),
+            Some("402332")
+        );
+    }
+
+    #[tokio::test]
+    async fn scam_with_code_goes_to_scam_thread() {
+        let db = Db::open_in_memory().unwrap();
+        db.add_otp_pattern(Some("bank"), r"رمز:\s+(\d{4,8})")
+            .unwrap();
+        let tg = FakeTg::new();
+        let sorting = sorting_with(vec![Ok(stored("promotional", 0.9, &["scam"]))]);
+
+        handle_incoming(
+            &db,
+            "IR",
+            unknown_sms("/sms/1", "رمز: 402332"),
+            &tg,
+            &bus(),
+            &sorting,
+        )
+        .await
+        .unwrap();
+
+        let tid = db.sorted_topic("scam").unwrap().expect("scam thread");
+        assert!(db.sorted_topic("otp").unwrap().is_none());
+        assert_eq!(tg.rich_posts.lock().unwrap()[0].0, tid);
+        assert_eq!(recorded(&db)[0].otp_code.as_deref(), Some("402332"));
+    }
+
+    #[tokio::test]
+    async fn contact_message_stays_in_contact_thread() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db.upsert_contact("people/a", "Ali").unwrap();
+        db.replace_contact_numbers(id, &["+989121234567".into()])
+            .unwrap();
+        db.upsert_topic(&Topic {
+            thread_id: 42,
+            contact_id: Some(id),
+            default_e164: Some("+989121234567".into()),
+            title: "Ali (4567)".into(),
+            ignored: false,
+            sort: None,
+        })
+        .unwrap();
+        let tg = FakeTg::new();
+        let sorting = sorting_with(vec![Ok(stored("promotional", 0.9, &["scam"]))]);
+        let mut sms = unknown_sms("/sms/1", "win big");
+        sms.e164 = "09121234567".into();
+
+        handle_incoming(&db, "IR", sms, &tg, &bus(), &sorting)
+            .await
+            .unwrap();
+
+        let posts = tg.rich_posts.lock().unwrap();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].0, 42);
+        assert!(!posts[0].1.silent);
+        assert_eq!(
+            posts[0].1.html,
+            "🟨 <b>تبلیغاتی</b>  🟥 <b>کلاهبرداری/فیشینگ</b>\nwin big"
+        );
+        assert!(db.sorted_topic("promotional").unwrap().is_none());
+        assert!(db.sorted_topic("scam").unwrap().is_none());
+        assert_eq!(tg.next_thread.load(Ordering::SeqCst), 100);
+        assert_eq!(recorded(&db)[0].thread_id, 42);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn classifier_failure_posts_unclassified_in_general() {
+        let db = Db::open_in_memory().unwrap();
+        let tg = FakeTg::new();
+        let config = Arc::new(SortingConfig::load(None).unwrap());
+        let fake = Arc::new(FakeClassifier::new(vec![
+            Err(ClassifyError::Timeout),
+            Err(ClassifyError::Timeout),
+            Err(ClassifyError::Timeout),
+        ]));
+        let sorting = Sorting {
+            classifier: Some(Arc::new(GuardedClassifier::new(
+                fake.clone(),
+                config.retry.clone(),
+                config.breaker.clone(),
+            ))),
+            config,
+        };
+        let bus = bus();
+        let mut events = bus.subscribe();
+
+        handle_incoming(
+            &db,
+            "IR",
+            unknown_sms("/sms/1", "hello"),
+            &tg,
+            &bus,
+            &sorting,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 3);
+        let posts = tg.rich_posts.lock().unwrap();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].0, GENERAL_THREAD);
+        assert!(!posts[0].1.silent);
+        assert_eq!(posts[0].1.html, "+989981600237\nhello");
+        assert_eq!(events.try_recv().unwrap().thread_id, GENERAL_THREAD);
+        assert!(recorded(&db)[0].classification.is_none());
+        assert_eq!(
+            db.pending_classification(None, &["pending"], None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn classifier_disabled_still_extracts_and_sorts_otp() {
+        let db = Db::open_in_memory().unwrap();
+        db.add_otp_pattern(Some("bank"), r"رمز:\s+(\d{4,8})")
+            .unwrap();
+        let tg = FakeTg::new();
+
+        handle_incoming(
+            &db,
+            "IR",
+            unknown_sms("/sms/1", "رمز: ۴۰۲۳۳۲"),
+            &tg,
+            &bus(),
+            &Sorting::disabled(),
+        )
+        .await
+        .unwrap();
+
+        let tid = db.sorted_topic("otp").unwrap().expect("otp thread");
+        assert_eq!(tg.rich_posts.lock().unwrap()[0].0, tid);
+        assert_eq!(recorded(&db)[0].otp_code.as_deref(), Some("402332"));
+    }
+
+    #[tokio::test]
+    async fn unlearned_otp_gets_teach_button() {
+        let db = Db::open_in_memory().unwrap();
+        let tg = FakeTg::new();
+
+        handle_incoming(
+            &db,
+            "IR",
+            unknown_sms("/sms/1", "کد ورود: 5388"),
+            &tg,
+            &bus(),
+            &Sorting::disabled(),
+        )
+        .await
+        .unwrap();
+
+        let posts = tg.rich_posts.lock().unwrap();
+        assert_eq!(posts[0].0, GENERAL_THREAD);
+        assert_eq!(
+            posts[0].1.buttons,
+            vec![("Teach code".to_string(), "otp:teach".to_string())]
+        );
+        let tg_msg = tg.next_message.load(Ordering::SeqCst) - 1;
+        let row = db
+            .inbound_by_tg_msg(tg_msg)
+            .unwrap()
+            .expect("recorded with tg_msg");
+        assert_eq!(row.body, "کد ورود: 5388");
+    }
+
+    #[tokio::test]
+    async fn raw_sender_is_general_bound_and_can_be_sorted() {
+        let db = Db::open_in_memory().unwrap();
+        let tg = FakeTg::new();
+        let sorting = sorting_with(vec![Ok(stored("promotional", 0.9, &[]))]);
+        let mut sms = unknown_sms("/sms/1", "sale");
+        sms.e164 = "Snapp".into();
+
+        handle_incoming(&db, "IR", sms, &tg, &bus(), &sorting)
+            .await
+            .unwrap();
+
+        let tid = db
+            .sorted_topic("promotional")
+            .unwrap()
+            .expect("sorted topic");
+        let posts = tg.rich_posts.lock().unwrap();
+        assert_eq!(posts[0].0, tid);
+        assert_eq!(posts[0].1.html, "🟨 <b>تبلیغاتی</b>\nSnapp\nsale");
+        assert_eq!(recorded(&db)[0].e164, "Snapp");
+    }
+
+    #[tokio::test]
+    async fn telegram_failure_leaves_sms_unrecorded() {
+        let db = Db::open_in_memory().unwrap();
+        let tg = FakeTg::new();
+        let sorting = sorting_with(vec![
+            Ok(stored("promotional", 0.9, &[])),
+            Ok(stored("promotional", 0.9, &[])),
+        ]);
+        let sms = unknown_sms("/sms/1", "off 50%");
+
+        tg.fail.store(true, Ordering::SeqCst);
+        assert!(
+            handle_incoming(&db, "IR", sms.clone(), &tg, &bus(), &sorting)
+                .await
+                .is_err()
+        );
+        assert!(recorded(&db).is_empty());
+        assert!(!db.seen_sms_path("/sms/1").unwrap());
+        assert!(db.sorted_topic("promotional").unwrap().is_none());
+
+        tg.fail.store(false, Ordering::SeqCst);
+        handle_incoming(&db, "IR", sms, &tg, &bus(), &sorting)
+            .await
+            .unwrap();
+        assert_eq!(tg.rich_posts.lock().unwrap().len(), 1);
+        assert_eq!(recorded(&db).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deleted_sorted_thread_is_recreated_and_the_post_retried() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_sorted_topic("promotional", 77, "تبلیغاتی")
+            .unwrap();
+        let tg = FakeTg::new();
+        tg.missing_threads.lock().unwrap().insert(77);
+        let sorting = sorting_with(vec![Ok(stored("promotional", 0.9, &[]))]);
+
+        handle_incoming(
+            &db,
+            "IR",
+            unknown_sms("/sms/1", "off"),
+            &tg,
+            &bus(),
+            &sorting,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(db.sorted_topic("promotional").unwrap(), Some(100));
+        let posts = tg.rich_posts.lock().unwrap();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].0, 100);
+        let rows = recorded(&db);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].thread_id, 100);
+    }
+
+    #[tokio::test]
+    async fn other_post_errors_in_a_sorted_thread_are_not_retried() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_sorted_topic("promotional", 77, "تبلیغاتی")
+            .unwrap();
+        let tg = FakeTg::new();
+        tg.fail.store(true, Ordering::SeqCst);
+        let sorting = sorting_with(vec![Ok(stored("promotional", 0.9, &[]))]);
+
+        assert!(handle_incoming(
+            &db,
+            "IR",
+            unknown_sms("/sms/1", "off"),
+            &tg,
+            &bus(),
+            &sorting
+        )
+        .await
+        .is_err());
+        assert_eq!(db.sorted_topic("promotional").unwrap(), Some(77));
+        assert_eq!(tg.next_thread.load(Ordering::SeqCst), 100);
+    }
+
+    #[test]
+    fn thread_gone_errors_are_recognised() {
+        for text in [
+            "Bad Request: message thread not found",
+            "Bad Request: TOPIC_DELETED",
+            "Bad Request: Message thread not found",
+        ] {
+            assert!(thread_is_gone(&AppError::Telegram(text.into())), "{text}");
+        }
+        assert!(!thread_is_gone(&AppError::Telegram("fail".into())));
+        assert!(!thread_is_gone(&AppError::Telegram(
+            "Bad Request: chat not found".into()
+        )));
+    }
+
+    #[tokio::test]
+    async fn post_failure_in_existing_sorted_thread_leaves_sms_unrecorded() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_sorted_topic("promotional", 77, "تبلیغاتی")
+            .unwrap();
+        let tg = FakeTg::new();
+        tg.fail.store(true, Ordering::SeqCst);
+        let sorting = sorting_with(vec![Ok(stored("promotional", 0.9, &[]))]);
+
+        assert!(handle_incoming(
+            &db,
+            "IR",
+            unknown_sms("/sms/1", "off"),
+            &tg,
+            &bus(),
+            &sorting
+        )
+        .await
+        .is_err());
+        assert!(recorded(&db).is_empty());
+        assert!(!db.seen_sms_path("/sms/1").unwrap());
+    }
+
+    #[tokio::test]
+    async fn stale_inbound_records_otp_code_without_posting() {
+        let db = Db::open_in_memory().unwrap();
+        db.add_otp_pattern(Some("bank"), r"رمز:\s+(\d{4,8})")
+            .unwrap();
+        let tg = FakeTg::new();
+        let bus = bus();
+        let mut events = bus.subscribe();
+        let mut sms = unknown_sms("/sms/old", "رمز: 402332");
+        sms.timestamp = "2024-12-21T15:12:23+03:30".into();
+        let sorting = sorting_with(vec![]);
+
+        handle_incoming(&db, "IR", sms, &tg, &bus, &sorting)
+            .await
+            .unwrap();
+
+        assert!(tg.posts.lock().unwrap().is_empty());
+        assert!(tg.rich_posts.lock().unwrap().is_empty());
+        assert!(db.sorted_topic("otp").unwrap().is_none());
+        assert_eq!(events.try_recv().unwrap().thread_id, GENERAL_THREAD);
+        let rows = recorded(&db);
+        assert_eq!(rows[0].otp_code.as_deref(), Some("402332"));
+        assert!(rows[0].classification.is_none());
+    }
+
+    #[tokio::test]
+    async fn html_special_chars_are_escaped() {
+        let db = Db::open_in_memory().unwrap();
+        let tg = FakeTg::new();
+
+        handle_incoming(
+            &db,
+            "IR",
+            unknown_sms("/sms/1", "<b>x</b> & y"),
+            &tg,
+            &bus(),
+            &Sorting::disabled(),
+        )
+        .await
+        .unwrap();
+
+        let posts = tg.rich_posts.lock().unwrap();
+        assert!(posts[0].1.html.contains("&lt;b&gt;x&lt;/b&gt; &amp; y"));
     }
 
     fn sweep_now() -> chrono::DateTime<chrono::Utc> {

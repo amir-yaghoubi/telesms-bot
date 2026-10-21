@@ -85,6 +85,9 @@ pub fn plan_outbound(db: &Db, thread_id: i32) -> Result<OutboundPlan, DbError> {
     let Some(topic) = db.get_topic_by_thread(thread_id)? else {
         return Ok(OutboundPlan::UnknownTopic);
     };
+    if topic.sort.is_some() {
+        return Ok(OutboundPlan::NotSms);
+    }
     if let Some(e164) = topic.default_e164 {
         return Ok(OutboundPlan::Send { e164 });
     }
@@ -181,6 +184,7 @@ mod tests {
             default_e164: Some(a.into()),
             title: "Ali (0001)".into(),
             ignored: false,
+            sort: None,
         })
         .unwrap();
         match route_inbound(&db, b).unwrap() {
@@ -205,6 +209,17 @@ mod tests {
     }
 
     #[test]
+    fn sorted_thread_is_not_sms_capable() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_sorted_topic("promotional", 77, "تبلیغاتی")
+            .unwrap();
+        assert!(matches!(
+            plan_outbound(&db, 77).unwrap(),
+            OutboundPlan::NotSms
+        ));
+    }
+
+    #[test]
     fn contact_topic_without_default_and_two_numbers_asks() {
         let db = Db::open_in_memory().unwrap();
         let id = db.upsert_contact("people/a", "Ali").unwrap();
@@ -216,6 +231,7 @@ mod tests {
             default_e164: None,
             title: "Ali".into(),
             ignored: false,
+            sort: None,
         })
         .unwrap();
         match plan_outbound(&db, 42).unwrap() {
@@ -242,6 +258,7 @@ mod tests {
             default_e164: Some("+989120000001".into()),
             title: "Ali".into(),
             ignored: false,
+            sort: None,
         })
         .unwrap();
         match plan_outbound(&db, 42).unwrap() {
@@ -269,6 +286,7 @@ mod tests {
             default_e164: Some(a.into()),
             title: "Ali (0001)".into(),
             ignored: false,
+            sort: None,
         })
         .unwrap();
         match route_for_send(&db, b).unwrap() {

@@ -26,6 +26,7 @@ async fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("check-modem") => check_modem().await,
         Some("auth") => google_auth().await,
+        Some("classify") => classify_cli().await,
         _ => run_daemon().await,
     }
 }
@@ -44,6 +45,64 @@ async fn google_auth() {
     .expect("auth");
 }
 
+/// An env var that is set and not blank.
+fn env_opt(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+}
+
+async fn classify_cli() {
+    use telesms_bot::sorting::sweep::{classify_pending, CliMode, SweepRun};
+
+    let mode = match std::env::args().nth(2).as_deref() {
+        None | Some("--missing") => CliMode::Missing,
+        Some("--failed") => CliMode::Failed,
+        Some("--force") => CliMode::Force,
+        Some(other) => {
+            eprintln!("unknown option {other}; usage: classify [--missing | --failed | --force]");
+            std::process::exit(2);
+        }
+    };
+    let url = env_opt("CLASSIFIER_URL");
+    let model = env_opt("CLASSIFIER_MODEL");
+    let endpoint = url.as_deref().zip(model.as_deref());
+    let config_path = env_opt("SORTING_CONFIG_PATH").map(std::path::PathBuf::from);
+    let sorting = telesms_bot::sorting::Sorting::build(endpoint, config_path.as_deref())
+        .unwrap_or_else(|err| {
+            eprintln!("sorting config: {err}");
+            std::process::exit(1);
+        });
+    let Some(classifier) = sorting.classifier.clone() else {
+        eprintln!("classifier disabled: set CLASSIFIER_URL and CLASSIFIER_MODEL");
+        std::process::exit(1);
+    };
+    let database_path =
+        env_opt("DATABASE_PATH").unwrap_or_else(|| "./data/telesms.sqlite".to_string());
+    let db = Db::open(std::path::Path::new(&database_path)).expect("db");
+    let report = classify_pending(
+        &db,
+        classifier.as_ref(),
+        None,
+        &SweepRun::cli(mode),
+        sorting.config.sweep.max_attempts,
+    )
+    .await
+    .expect("classify");
+    println!("classified {}, failed {}", report.classified, report.failed);
+    if report.stopped_by_breaker {
+        eprintln!("classifier unreachable; stopped early");
+    }
+    std::process::exit(classify_exit_code(&report));
+}
+
+/// 0 when the run finished, 3 when the breaker stopped it early.
+fn classify_exit_code(report: &telesms_bot::sorting::sweep::SweepReport) -> i32 {
+    if report.stopped_by_breaker {
+        3
+    } else {
+        0
+    }
+}
+
 async fn check_modem() {
     let mm = telesms_bot::modem_mm::MmModem::connect()
         .await
@@ -58,6 +117,16 @@ async fn run_daemon() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).expect("create database directory");
         }
+    }
+    let sorting =
+        telesms_bot::sorting::Sorting::build(cfg.classifier(), cfg.sorting_config_path.as_deref())
+            .unwrap_or_else(|err| {
+                eprintln!("sorting config: {err}");
+                std::process::exit(1);
+            });
+    match cfg.classifier() {
+        Some((url, model)) => tracing::info!(url, model, "classifier enabled"),
+        None => tracing::info!("classifier disabled"),
     }
     let db = Arc::new(Db::open(&cfg.database_path).expect("db"));
     let bus = telesms_bot::events::EventBus::new(telesms_bot::events::EVENT_BUFFER);
@@ -103,6 +172,7 @@ async fn run_daemon() {
         tg: tg.clone(),
         delete_enabled: cfg.sms_delete_enabled,
         bus: bus.clone(),
+        sorting: sorting.clone(),
     };
     let mm_in = mm.clone();
     let cancel_in = cancel.clone();
@@ -119,6 +189,7 @@ async fn run_daemon() {
         forward: forward.clone(),
         tg: tg.clone(),
         bus: bus.clone(),
+        sorting: sorting.clone(),
     };
 
     if cfg.api_enabled() {
@@ -173,14 +244,42 @@ async fn run_daemon() {
         });
     }
 
+    tasks.spawn(telesms_bot::sorting::sweep::run_sweep(
+        db.clone(),
+        sorting.clone(),
+        bus.clone(),
+        cancel.clone(),
+    ));
+
     let send = telesms_bot::app::SendDeps {
         modem: modem.clone(),
         bus: bus.clone(),
     };
-    telegram::dispatch(cfg, db, send, info, forward).await;
+    telegram::dispatch(cfg, db, send, info, forward, sorting.config.clone()).await;
     cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
         while tasks.join_next().await.is_some() {}
     })
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use telesms_bot::sorting::sweep::SweepReport;
+
+    #[test]
+    fn classify_exits_3_only_when_the_breaker_stopped_it() {
+        let done = SweepReport {
+            classified: 2,
+            failed: 1,
+            stopped_by_breaker: false,
+        };
+        assert_eq!(classify_exit_code(&done), 0);
+        let stopped = SweepReport {
+            stopped_by_breaker: true,
+            ..done
+        };
+        assert_eq!(classify_exit_code(&stopped), 3);
+    }
 }

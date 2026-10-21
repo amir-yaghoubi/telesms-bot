@@ -245,8 +245,7 @@ impl GooglePeople {
             if let Some(pt) = &page_token {
                 req = req.query(&[("pageToken", pt.as_str())]);
             }
-            let resp =
-                ensure_people_success(req.send().await.map_err(classify_send_err)?).await?;
+            let resp = ensure_people_success(req.send().await.map_err(classify_send_err)?).await?;
             let body = resp.text().await?;
             let (page, next) = parse_people_page(&body, region)?;
             all.extend(page);

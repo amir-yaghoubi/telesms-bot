@@ -1,5 +1,8 @@
 use teloxide::types::BotCommand;
 
+use crate::otp::normalize_digits;
+use crate::sorting::TEACH_CALLBACK;
+
 use crate::config::Config;
 use crate::db::Topic;
 
@@ -61,6 +64,7 @@ pub fn bot_commands() -> Vec<BotCommand> {
         BotCommand::new("ignore", "Stop auto-creating a topic for this number"),
         BotCommand::new("forward", "Manage unconditional call forwarding"),
         BotCommand::new("status", "Modem and gateway status"),
+        BotCommand::new("otp", "Reply to an SMS with /otp <code> to teach its code"),
     ]
 }
 
@@ -94,6 +98,9 @@ SMS from this forum.
 /status
   Modem, SIM, today's SMS counts, last in/out, contacts.
   Works in any topic and in a private chat with the bot.
+
+/otp <code>
+  Reply to an SMS with its one-time code to teach the bot that format.
 
 Typing in a contact topic sends SMS to that contact's default number.
 Text in General is not an SMS unless you use /sms."
@@ -191,10 +198,45 @@ pub fn topic_open_message(group_id: i64, topic: &Topic) -> String {
     }
 }
 
+/// The number a reply targets: the first line that starts with `+` and digits,
+/// so the heading, code and any `+`-prefixed text are skipped.
 pub fn parse_ignore_reply(text: &str) -> Option<&str> {
-    let first = text.lines().next()?.trim();
-    if !first.starts_with('+') {
+    text.lines().find_map(|line| {
+        let token = line.split_whitespace().next()?;
+        let digits = token.strip_prefix('+')?;
+        (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then_some(token)
+    })
+}
+
+/// The code in `/otp <code>`, with Persian and Arabic-Indic digits normalized.
+pub fn parse_otp_cmd(text: &str) -> Option<String> {
+    let rest = text.strip_prefix("/otp")?;
+    let rest = if let Some(after_at) = rest.strip_prefix('@') {
+        after_at.split_once(char::is_whitespace)?.1
+    } else if rest.starts_with(char::is_whitespace) {
+        rest
+    } else {
         return None;
-    }
-    first.split_whitespace().next()
+    };
+    parse_code(rest)
+}
+
+/// Digits only, normalized; `None` for anything else.
+pub(crate) fn parse_code(text: &str) -> Option<String> {
+    let code = normalize_digits(text.trim());
+    (!code.is_empty() && code.bytes().all(|b| b.is_ascii_digit())).then_some(code)
+}
+
+pub fn is_otp_teach_callback(data: &str) -> bool {
+    data == TEACH_CALLBACK
+}
+
+const TEACH_PROMPT: &str = "Reply with the code for message in:";
+
+pub fn teach_prompt(inbound_id: i64) -> String {
+    format!("{TEACH_PROMPT}{inbound_id}")
+}
+
+pub fn parse_teach_prompt(text: &str) -> Option<i64> {
+    text.strip_prefix(TEACH_PROMPT)?.trim().parse().ok()
 }
